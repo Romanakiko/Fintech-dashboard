@@ -156,7 +156,7 @@ The system covers these problems:
 5. **Pure domain core.** Metric formulas, the aggregator, validation and formatting are framework-free pure TS. They are trivially unit-testable and shared by the worker and the UI.
 6. **Ports and adapters.** The engine depends on the interfaces `MarketGenerator`, `Scheduler`, `Clock` and `EventSink`. The Wasm adapter, timers and `postMessage` are adapters that tests replace.
 7. **Signals all the way.** Stores expose read-only signals. Components use `computed()`. Zoneless change detection with OnPush (Angular 22 defaults).
-8. **Integer money, decimal at the boundary.** Prices are cents (`u32` in Wasm, safe integers in TS). The VWAP numerator `Σ(cents×qty)` is accumulated exactly. The only division (VWAP) runs once per snapshot in a decimal library with an explicit rounding mode. Results cross the thread boundary as decimal strings, never as floats (§5.6).
+8. **Integer money, decimal at the boundary.** Prices are cents (`u32` in Wasm, safe integers in TS). The VWAP numerator `Σ(cents×qty)` is accumulated exactly. The only division (VWAP) runs on the main thread in a decimal library and is rounded exactly once, for display. Exact integers and a `bigint` notional cross the thread boundary, never floats or pre-rounded values (§5.6).
 9. **Fail loudly and recoverably.** Typed error events, an `error` producer state and a user-visible Retry action. No silent swallowing.
 
 ### 4.3 Where things live (decision summary)
@@ -165,7 +165,7 @@ The system covers these problems:
 |---|---|---|
 | PRNG, price/qty/book evolution | Rust → Wasm | Required by the task. Deterministic and fast. |
 | Metric aggregation (volume, VWAP, last, book) | TS in Worker (`MarketAggregator`) | Off the main thread. Pure TS keeps metric tests in the same toolchain as the UI. Wasm stays a pure data generator (single responsibility). |
-| Derived metrics (spread, OBI, VWAP division) | Pure TS functions (`metrics.ts`), evaluated in the worker at snapshot time. VWAP division uses `decimal.js`. | One implementation, unit-tested against the worked example. |
+| Derived metrics (spread, OBI, VWAP division) | Pure TS functions (`metrics.ts`), evaluated on the main thread per conflated snapshot (≤ 50 instruments). VWAP division uses `decimal.js`, and the result is rounded once for display. | One implementation, unit-tested against the worked example. Exact inputs cross the thread boundary, so there is no double rounding (§5.6). |
 | Formatting (currency, signed OBI, "unavailable") | Main thread, pure formatter functions plus `Intl.NumberFormat`. Money is formatted from decimal **strings**. | Presentation concern, locale-aware, no float round-trip. |
 | Run counter, settings | Main thread stores | UI owns intent. The worker obeys commands. |
 
@@ -242,8 +242,8 @@ Build: `cargo build --release --target wasm32-unknown-unknown`, with `opt-level=
 - `last`, `bid`, `ask`, `bidQty`, `askQty` (Float64Array, NaN = no data yet)
 - `volume` (Float64Array; max 20k×1000/s means about 2e7/s, which stays safe for more than 10 years)
 - `notional`: an exact `Σ(cents×qty)`. Within a batch it accumulates in a per-instrument Float64 holding integers only (≤ 1000 updates × 2^32 × 1000, well under 2^53). After each batch it carries into a `BigInt` per instrument. That costs at most 50 BigInt adds per batch. **Exact for unbounded run length.**
-- VWAP: at snapshot time, `new Dec(notional.toString()).div(volume).toFixed(4)`, where `Dec = Decimal.clone({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN })`. A local clone keeps the global `Decimal` config untouched. That gives VWAP in cents with 4 extra decimals, e.g. `10150.0000` cents. It is emitted as a decimal **string** (§5.6).
-- `snapshot()` produces SoA `Float64Array`s for the integer fields (last, bid, ask, spread in cents; bidQty, askQty, volume; obi), sent as **transferable** buffers, plus `vwapCents: (string | null)[]`. OBI is a dimensionless ratio, not money, so a float is correct for it.
+- The worker does **not** divide. VWAP is derived on the main thread from the exact notional and volume, and rounded exactly once, for display (§5.6). The worker therefore stays integer-only and never loads decimal.js.
+- `snapshot()` returns one plain, readonly `InstrumentTotals` object per instrument: `{ lastPriceCents, bidCents, askCents, bidQty, askQty: number | null; volume: number; notionalCents: bigint }`. `null` means "no data yet", which is type-safe, unlike a NaN sentinel. `bigint` is structured-cloneable, so the exact notional crosses `postMessage` as-is. *Implementation note:* this replaces the earlier typed-array/transferable snapshot design. The snapshot is O(instruments) (≤ 50) and conflated to at most one per batch, so the structured-clone cost is negligible. The zero-copy optimisation stays where it matters: the per-update path from Wasm memory into the aggregator.
 
 ### 5.3 Main-thread services (`@Service`, root singletons)
 
@@ -314,13 +314,14 @@ So money in this system needs exact integer accumulation on the hot path and a *
 
 **Decision (ADR-9): a hybrid with layered responsibilities**
 1. **Hot path (worker, per update):** integers only, no library. Prices are `u32` cents, quantities are integers, and notional uses a Float64 integer accumulator with a per-batch BigInt carry. Every generated trade costs one integer multiply-add and creates no objects or GC pressure. At 20k updates/s a decimal library would allocate about 40k objects/s for no gain, because these operations are already exact.
-2. **Boundary (worker, per snapshot):** **`decimal.js`** for the VWAP division, through a private constructor `Dec = Decimal.clone({ precision: 40, rounding: ROUND_HALF_EVEN })`. The output is cents with 4 extra decimals, using banker's rounding, which is the usual choice in finance because it avoids systematic rounding bias. The result is serialized as a decimal string.
-   - *Why precision 40 is safe from double rounding:* `div` rounds to 40 significant digits before `toFixed(4)` rounds again. A wrong half-even tie would need the exact quotient to have a run of 0s or 9s beyond decimal 4 longer than `log10(volume)` (≤ 15) digits, which is impossible for a non-terminating `n/d` with `d ≤ 10^15`. VWAP has ≤ 10 integer digits, so 10 + 4 + 15 < 40.
-3. **Presentation (main thread):** a `Money` helper in `core/money.ts` turns cents or decimal-string cents into a dollars string with `decimal.js` (`toFixed(2, ROUND_HALF_EVEN)`). `Intl.NumberFormat` formats that string. A JS `number` never holds a fractional money value.
-4. **Encapsulation:** all `decimal.js` usage sits behind `core/money.ts`, with functions such as `vwapCents`, `centsToDecimalString` and `formatMoney`. Swapping it for Dinero.js or the native TC39 `Decimal` later is a one-file change.
-5. **Evidence:** in Phase 2, a Vitest `bench` compares (a) the integer hot path with (b) the same aggregation using `decimal.js` per update, at 20k updates/s. The numbers go in the README as the justification for the hybrid.
+2. **Transport (worker → main):** the **exact** inputs cross the thread boundary, as integer cents (`number`) plus the notional as `bigint` (structured-cloneable). No quotient is computed or rounded in the worker.
+3. **Presentation (main thread, per snapshot):** `core/money.ts` computes `vwapCents(notional, volume)` with **decimal.js** through a private constructor `Money = Decimal.clone({ precision: 40, rounding: ROUND_HALF_EVEN })`. It keeps full precision as a decimal string. `formatMoney` then rounds **once**, half-even, to whole cents (`toFixed(2, ROUND_HALF_EVEN)`), and `Intl.NumberFormat` formats that decimal string. A JS `number` never holds a fractional money value.
+   - *Why one rounding matters:* the earlier draft rounded VWAP to 4 decimals of a cent in the worker and then again for display. That is **double rounding**: an exact 101.505000001 becomes 10150.5000 cents and then, half-even, $101.50 instead of $101.51. A unit test pins this case.
+   - *Why precision 40 is enough:* the division's internal rounding to 40 significant digits cannot create a false tie at the 2nd decimal. That would need a run of 0s or 9s longer than `log10(volume)` (≤ 15) digits in a non-terminating `n/d` with `d ≤ 10^15`, and VWAP has ≤ 13 integer digits, so 13 + 2 + 15 < 40.
+4. **Encapsulation:** all `decimal.js` usage sits behind `core/money.ts` (`vwapCents`, `centsToDollars`). Swapping it for Dinero.js or the native TC39 `Decimal` later is a one-file change. decimal.js ships only in the main bundle, and the worker never imports it.
+5. **Evidence:** a micro-benchmark (Phase 6) compares the integer hot path with the same aggregation using `decimal.js` per update at 20k updates/s. The numbers go in the README.
 
-**Tests:** the worked example gives a VWAP string of `"10150.0000"` and displays as `$101.50`. Half-even ties round both ways: `x.xx5` rounds to even. Exactness holds after 10^9 simulated trades through a synthetic large notional. An unavailable value (volume 0) gives `null` and displays as `—`.
+**Tests:** the worked example gives a VWAP of `"10150"` cents, displayed as `$101.50`. Half-even ties round to even (`10150.5` → `$101.50`, `10151.5` → `$101.52`). A value just above a tie rounds up, proving there is a single rounding. Notional stays exact beyond 2^53 through the BigInt carry. Volume 0 gives `null`, displayed as `—`.
 
 ---
 
@@ -334,27 +335,34 @@ export interface ProducerSettings {
   readonly batchIntervalMs: number;  // int 50..2000
 }
 
-// core/protocol.ts  (PROTOCOL_VERSION = 1)
+// core/protocol.ts  (implemented; validated by isProducerCommand() at the worker boundary)
 export type ProducerCommand =
   | { type: 'load'; wasmUrl: string }
-  | { type: 'start'; runId: number; settings: ProducerSettings; seed: [number, number] }
+  | { type: 'start'; runId: number; settings: ProducerSettings; seed: [lo: number, hi: number] }
   | { type: 'pause'; runId: number }
   | { type: 'resume'; runId: number }
   | { type: 'ack'; runId: number; seq: number };
 
 export type ProducerEvent =
-  | { type: 'ready'; abiVersion: number }
+  | { type: 'ready' }
   | { type: 'status'; runId: number; state: 'running' | 'paused' }
-  | { type: 'snapshot'; runId: number; seq: number; stats: ProducerStats; data: SnapshotData; vwapCents: (string | null)[] }
+  | { type: 'snapshot'; runId: number; seq: number; stats: ProducerStats; instruments: InstrumentTotals[] }
   | { type: 'error'; runId: number | null; code: ProducerErrorCode; message: string; fatal: boolean };
 
-export interface SnapshotData {           // SoA, all length = instrumentCount, NaN = unavailable
-  last: Float64Array; bid: Float64Array; ask: Float64Array;   // integer cents
-  spread: Float64Array;                                       // integer cents
-  obi: Float64Array;                                          // ratio in [-1, 1]
-  bidQty: Float64Array; askQty: Float64Array; volume: Float64Array; // integers
+// core/aggregator.ts — one per instrument; null = no data yet
+export interface InstrumentTotals {
+  lastPriceCents: number | null; bidCents: number | null; askCents: number | null;
+  bidQty: number | null; askQty: number | null;
+  volume: number;          // Σ tradeQty
+  notionalCents: bigint;   // exact Σ priceCents × tradeQty
 }
-// VWAP travels separately as decimal strings in cents (e.g. "10150.0000"), null = unavailable.
+
+// core/metrics.ts — derived on the main thread
+export interface InstrumentMetrics {
+  lastPriceCents: number | null; spreadCents: number | null; volume: number;
+  vwapCents: string | null;  // exact decimal string, rounded only by formatMoney()
+  imbalance: number | null;  // [-1, 1]
+}
 ```
 
 Symbols are produced by a deterministic table of 50 four-letter symbols in `core/symbols.ts` (`ALFA, BETA, GAMA, DELT, …`). The Wasm library deals only in indices.
@@ -539,7 +547,8 @@ Fintech-dashboard/
 │  ├─ core/                (framework-free, shared by worker + UI)
 │  │  ├─ settings.ts       defaults, limits, validateSettings()
 │  │  ├─ protocol.ts       commands/events, type guards
-│  │  ├─ money.ts          decimal.js wrapper: vwapCents(), centsToDecimal(), formatMoney()
+│  │  ├─ money.ts          decimal.js wrapper: vwapCents(), centsToDollars()
+│  │  ├─ market-update.ts  Wasm update record layout (stride, field offsets, ABI version)
 │  │  ├─ metrics.ts        spread(), vwap(), imbalance()
 │  │  ├─ aggregator.ts     MarketAggregator
 │  │  ├─ symbols.ts
@@ -572,7 +581,7 @@ Fintech-dashboard/
 | ADR-6 | Single **root-scoped** producer client, eager initializer | Producer in a component | Survives navigation. It is created exactly once (FR-N2). |
 | ADR-7 | **Signal Forms** for settings | Reactive Forms | Angular 22 stable API, signal-native and schema-validated (project guideline). |
 | ADR-8 | **Render Static Site** via `render.yaml`, auto-deploy on `checksPass`. GitHub Actions is the CI gate. | GitHub Pages, Cloudflare Pages, Vercel | Owner's choice. Real HTTP headers (CSP, HSTS, future COOP/COEP), SPA rewrites, infrastructure as code, deploys gated on green CI, CDN. Trade-off: Render builds from source, so it needs the Rust toolchain (§10.2, fallback §10.5). |
-| ADR-9 | **Hybrid money model:** integers on the hot path (per-batch BigInt carry for notional), **decimal.js** (private `Decimal.clone`, precision 40) for VWAP division and display rounding (`ROUND_HALF_EVEN`), and decimal strings across the thread boundary | Plain Number. All-BigInt with hand-written rounding. big.js. A decimal library or Dinero.js on every update. | Exact where exactness is free, explicit rounding policy where it isn't, no per-update allocation, and the de-facto standard decimal library (owner's choice) behind a one-file seam (§5.6). |
+| ADR-9 | **Hybrid money model:** integers on the hot path (per-batch BigInt carry for notional), **decimal.js** (private `Decimal.clone`, precision 40) for VWAP division and a single display rounding (`ROUND_HALF_EVEN`), with exact integer/bigint values across the thread boundary | Plain Number. All-BigInt with hand-written rounding. big.js. A decimal library or Dinero.js on every update. | Exact where exactness is free, explicit rounding policy where it isn't, no per-update allocation, and the de-facto standard decimal library (owner's choice) behind a one-file seam (§5.6). |
 
 ### 12.1 Wasm language options
 
@@ -616,7 +625,7 @@ Each step ends with a verifiable check and a commit, which keeps the development
 
 ### Phase 2 — Domain core (½ day)
 12. `core/settings.ts`: types, defaults, limits and `validateSettings`, with tests (boundaries, non-integers, NaN).
-12a. `npm i decimal.js` (ships its own types). `core/money.ts` (the only module that imports `decimal.js`): `vwapCents(notional: bigint, volume: number): string | null`, `centsToDecimal`, `formatMoney`, all with `ROUND_HALF_EVEN`. Tests cover half-even ties, null handling and string formatting. Add a Vitest `bench` comparing the integer hot path with `decimal.js` per update, and record the result for the README.
+12a. `npm i decimal.js` (ships its own types). `core/money.ts` (the only module that imports `decimal.js`): `vwapCents(notional: bigint, volume: number): string | null` (unrounded) and `centsToDollars` (single half-even rounding). Tests cover half-even ties, the single-rounding case, null handling and global-config isolation. The decimal-vs-integer benchmark moves to Phase 6.
 13. `core/metrics.ts`: `spread`, `vwap` (delegates to `money.ts`), `imbalance`, with "unavailable" on zero denominators. Tests cover the worked example and zero denominators.
 14. `core/aggregator.ts`: `ingest(view, n)`, `snapshot()`, `reset(count)` with BigInt carry. Tests cover the worked example via a hand-built `Uint32Array`, isolation between instruments, initial state, exactness at large magnitudes and reset.
 15. `core/format.ts` + `core/symbols.ts`, with tests.

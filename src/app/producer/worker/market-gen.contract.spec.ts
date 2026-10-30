@@ -1,6 +1,7 @@
 // Contract test: executes the compiled market_gen.wasm through the raw exports the worker relies on.
 // @ts-expect-error TypeScript cannot type imports based on the `loader` attribute.
 import wasmBytes from '../../../../public/wasm/market_gen.wasm' with { loader: 'binary' };
+import { UPDATE_STRIDE as STRIDE, WASM_ABI_VERSION } from '../../core/market-update';
 
 interface MarketGenExports {
   memory: WebAssembly.Memory;
@@ -10,8 +11,6 @@ interface MarketGenExports {
   generate(n: number): number;
   last_error(): number;
 }
-
-const STRIDE = 7;
 
 async function instantiate(): Promise<MarketGenExports> {
   const { instance } = await WebAssembly.instantiate(wasmBytes as Uint8Array<ArrayBuffer>);
@@ -27,7 +26,10 @@ function generate(wasm: MarketGenExports, n: number): Uint32Array {
 function invariantViolations(batch: Uint32Array, instruments: number): string[] {
   const violations: string[] = [];
   for (let offset = 0; offset < batch.length; offset += STRIDE) {
-    const [instrument, price, qty, bid, ask, bidQty, askQty] = batch.subarray(offset, offset + STRIDE);
+    const [instrument, price, qty, bid, ask, bidQty, askQty] = batch.subarray(
+      offset,
+      offset + STRIDE,
+    );
     const at = `update ${offset / STRIDE}`;
     if (instrument >= instruments) violations.push(`${at}: instrument ${instrument}`);
     if (bid <= 0 || bid >= ask) violations.push(`${at}: bid ${bid} / ask ${ask}`);
@@ -45,8 +47,8 @@ describe('market_gen.wasm contract', () => {
     wasm = await instantiate();
   });
 
-  it('exposes ABI version 1 with a 7 x u32 update record', () => {
-    expect(wasm.abi_version()).toBe(1);
+  it('exposes the ABI version and update record layout the app expects', () => {
+    expect(wasm.abi_version()).toBe(WASM_ABI_VERSION);
     expect(wasm.update_stride()).toBe(STRIDE);
     expect(wasm.memory).toBeInstanceOf(WebAssembly.Memory);
   });
