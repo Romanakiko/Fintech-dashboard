@@ -3,11 +3,18 @@
   "version": "0.0.0",
   "scripts": {
     "ng": "ng",
+    "prestart": "npm run build:wasm",
     "start": "ng serve",
+    "prebuild": "npm run build:wasm",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
+    "pretest": "npm run build:wasm",
     "test": "ng test",
-    "lint": "ng lint"
+    "lint": "ng lint",
+    "build:wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path wasm/market-gen/Cargo.toml && node scripts/copy-wasm.mjs",
+    "test:wasm": "cargo test --manifest-path wasm/market-gen/Cargo.toml",
+    "lint:wasm": "cargo fmt --check --manifest-path wasm/market-gen/Cargo.toml && cargo clippy --all-targets --manifest-path wasm/market-gen/Cargo.toml -- -D warnings",
+    "ci": "npm run lint && npm run lint:wasm && npm run test:wasm && npm test -- --watch=false && npm run build"
   },
   "private": true,
   "packageManager": "npm@10.8.2",

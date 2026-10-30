@@ -13,12 +13,44 @@ permissions:
   contents: read
 
 jobs:
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm/market-gen
+
+      - name: Format
+        run: cargo fmt --check --manifest-path wasm/market-gen/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --all-targets --manifest-path wasm/market-gen/Cargo.toml -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path wasm/market-gen/Cargo.toml
+
   web:
     name: web
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      # npm build/test hooks compile the Wasm module (same path as the Render build).
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wasm/market-gen
 
       - uses: actions/setup-node@v5
         with:

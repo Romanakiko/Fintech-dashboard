@@ -416,11 +416,11 @@ There are no real-time waits: all timing goes through injected `Scheduler`/`Cloc
 ## 10. Build, CI/CD pipeline and Render hosting
 
 ### 10.1 Local scripts (`package.json`)
-- `build:wasm` — `cargo build --release --target wasm32-unknown-unknown --manifest-path wasm/market-gen/Cargo.toml`, then `node scripts/copy-wasm.mjs`, which copies the output to `public/wasm/` (cross-platform)
-- `prestart` / `prebuild` / `pretest` → `build:wasm`
-- `test` — `ng test --watch=false`. `test:wasm` — `cargo test`. `test:all` — both.
-- `lint` — `ng lint && cargo fmt --check && cargo clippy -- -D warnings`
-- `ci` — `lint`, then `test:all`, then `build`. One command reproduces CI locally.
+- `build:wasm` — `cargo build --release --target wasm32-unknown-unknown --manifest-path wasm/market-gen/Cargo.toml`, then `node scripts/copy-wasm.mjs`. The script copies the output to `public/wasm/` and **fails the build if the binary exceeds 50 kB**.
+- `prestart` / `prebuild` / `pretest` → `build:wasm`. Every npm entry point therefore requires Rust. Calling `ng build` directly skips the hook.
+- `test` — `ng test` (Vitest; includes the Wasm contract test). `test:wasm` — `cargo test`.
+- `lint` — `ng lint` (plus the worker type-check from Phase 3). `lint:wasm` — `cargo fmt --check` and `cargo clippy --all-targets -D warnings`.
+- `ci` — all lints, then both test suites, then `build`. One command reproduces CI locally.
 
 ### 10.2 Hosting on Render (Static Site)
 
@@ -495,8 +495,8 @@ Trigger: `push` to any branch and `pull_request` to `main`. Concurrency: `ci-${{
 
 | Job | Steps | Purpose |
 |---|---|---|
-| `wasm` | checkout → `dtolnay/rust-toolchain@stable` (targets: `wasm32-unknown-unknown`, components: `rustfmt, clippy`) → `Swatinem/rust-cache` → `cargo fmt --check` → `cargo clippy -D warnings` → `cargo test` → `cargo build --release --target wasm32-unknown-unknown` → size check (< 50 kB) → upload the `market_gen.wasm` artifact | Rust quality gate. Produces the binary once. |
-| `web` (needs `wasm`) | checkout → `actions/setup-node` (`node-version-file: .node-version`, `cache: npm`) → `npm ci` → download the wasm artifact into `public/wasm/` → `npm run lint` → `ng test --watch=false --coverage` (includes the wasm contract test) → `ng build` → upload the `dist` and coverage artifacts | Angular quality gate and production build check, including budgets. |
+| `wasm` | checkout → `dtolnay/rust-toolchain@stable` (target `wasm32-unknown-unknown`, components `rustfmt, clippy`) → `Swatinem/rust-cache` → `cargo fmt --check` → `cargo clippy --all-targets -D warnings` → `cargo test` | Rust quality gate. |
+| `web` (parallel) | checkout → Rust toolchain + cache → `actions/setup-node` (`node-version-file: .node-version`, `cache: npm`) → `npm ci` → `npm run lint` → `npm test` (the `pretest` hook builds the `.wasm` and checks its size; includes the contract test) → `npm run build` | Angular quality gate and production build, including budgets. It builds Wasm exactly the way Render does, so no artifact hand-off between jobs is needed. That is simpler, and the build path stays identical to production. |
 | `audit` (non-blocking) | `npm audit --audit-level=high`, `cargo audit` | Supply-chain visibility. |
 
 Branch protection on `main`: require the `wasm` and `web` checks, require a PR for changes (direct pushes allowed for the owner during the interview) and use linear history. Because Render's `autoDeployTrigger` is `checksPass`, **a red pipeline never reaches production**.
@@ -624,7 +624,7 @@ Each step ends with a verifiable check and a commit, which keeps the development
 17. **Commit** `feat(core): metrics, aggregator, settings validation`.
 
 ### Phase 3 — Worker and engine (1 day)
-18. Add `tsconfig.worker.json` (`lib: ["es2022","webworker"]`) and register it in `angular.json` (the `ng g web-worker` approach).
+18. Add `tsconfig.worker.json` (`lib: ["es2022","webworker"]`) and register it in `angular.json` (the `ng g web-worker` approach). **The application builder does not type-check worker code** (Angular docs, "Known issues"). Add `tsc --noEmit -p tsconfig.worker.json` to `npm run lint` so worker code is held to the same strict typing as the app.
 19. `scheduler.ts` (drift-compensated, injectable clock) with tests using fake timers.
 20. `producer-engine.ts` with ports (`MarketGenerator`, `Scheduler`, `EventSink`). Tests cover start, tick, pause, resume without back-fill, start while paused, reset on start, conflation/ack, errors and late ticks.
 21. `wasm-market-generator.ts` adapter: load with streaming fallback, ABI checks, view refresh on memory growth and error mapping.
@@ -705,6 +705,7 @@ Each step ends with a verifiable check and a commit, which keeps the development
 | Render free tier limits (build minutes, bandwidth) | Deploy delays | A static site has no spin-down. Keep builds lean (minimal rustup profile, npm cache). Monitor usage. |
 | Decimal library cost on the hot path | Jank at high rate | Library used only per snapshot (§5.6). The benchmark proves the budget. |
 | Angular worker bundling of shared `core/` code | Build errors | Keep `core/` free of Angular imports. Use a dedicated `tsconfig.worker.json`. |
+| Worker code is not type-checked by the Angular application builder | Type errors reach runtime | An explicit `tsc --noEmit -p tsconfig.worker.json` in `lint`, which CI runs. Engine logic lives in modules that specs also import, so they are type-checked by the test build too. |
 | SPA deep links 404 on the host | Broken refresh on `/settings` | Render `routes` rewrite `/* → /index.html`. The wasm URL is resolved against `document.baseURI`. |
 | Signal Forms API differences between minor versions | Rework | Pin the Angular version. Verify the API against the current docs before implementation. |
 | A detached Wasm memory view after growth | Silent corruption or crash | Pre-allocate at `init`. Re-create the view when `memory.buffer` identity changes. Cover this with a test. |

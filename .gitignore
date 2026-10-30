@@ -42,3 +42,7 @@ __screenshots__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Wasm build output
+/wasm/market-gen/target
+/public/wasm
