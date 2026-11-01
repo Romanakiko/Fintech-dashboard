@@ -1,0 +1,11 @@
+/* To learn more about Typescript configuration file: https://www.typescriptlang.org/docs/handbook/tsconfig-json.html. */
+/* Worker code is bundled by the application builder but not type-checked by it, so `npm run lint` runs `tsc -p` on this file. */
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./out-tsc/worker",
+    "lib": ["ES2022", "WebWorker"],
+    "types": []
+  },
+  "include": ["src/**/*.worker.ts"]
+}

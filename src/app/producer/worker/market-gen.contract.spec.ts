@@ -2,15 +2,7 @@
 // @ts-expect-error TypeScript cannot type imports based on the `loader` attribute.
 import wasmBytes from '../../../../public/wasm/market_gen.wasm' with { loader: 'binary' };
 import { UPDATE_STRIDE as STRIDE, WASM_ABI_VERSION } from '../../core/market-update';
-
-interface MarketGenExports {
-  memory: WebAssembly.Memory;
-  abi_version(): number;
-  update_stride(): number;
-  init(seedLo: number, seedHi: number, instruments: number, maxBatch: number): number;
-  generate(n: number): number;
-  last_error(): number;
-}
+import type { MarketGenExports } from './wasm-market-generator';
 
 async function instantiate(): Promise<MarketGenExports> {
   const { instance } = await WebAssembly.instantiate(wasmBytes as Uint8Array<ArrayBuffer>);

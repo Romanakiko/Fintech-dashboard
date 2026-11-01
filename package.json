@@ -10,7 +10,7 @@
     "watch": "ng build --watch --configuration development",
     "pretest": "npm run build:wasm",
     "test": "ng test",
-    "lint": "ng lint",
+    "lint": "ng lint && tsc --noEmit -p tsconfig.worker.json",
     "build:wasm": "cargo build --release --target wasm32-unknown-unknown --manifest-path wasm/market-gen/Cargo.toml && node scripts/copy-wasm.mjs",
     "test:wasm": "cargo test --manifest-path wasm/market-gen/Cargo.toml",
     "lint:wasm": "cargo fmt --check --manifest-path wasm/market-gen/Cargo.toml && cargo clippy --all-targets --manifest-path wasm/market-gen/Cargo.toml -- -D warnings",

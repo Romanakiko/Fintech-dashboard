@@ -217,26 +217,49 @@ Build: `cargo build --release --target wasm32-unknown-unknown`, with `opt-level=
 
 ### 5.2 Web Worker (`src/app/producer/worker/`)
 
-**`market.worker.ts` (entry)** — wires `self.onmessage`, validates incoming commands (type guard plus settings limits; defense in depth) and delegates to `ProducerEngine`. Uncaught errors are converted to `{type:'error'}` events.
+**`market.worker.ts` (entry)** — composition root. It builds `ProducerEngine` from the real adapters, validates every incoming message with `isProducerCommand` (defense in depth) and answers malformed ones with a non-fatal `INVALID_COMMAND` error. The engine reports anticipated failures itself. Anything else that escapes `handle()` is a bug, and the entry reports it as a fatal `WORKER_CRASHED` error, so the UI shows it instead of the worker dying silently.
 
-**`ProducerEngine`** — a state machine:
+**`ProducerEngine`** (`producer-engine.ts`) — a state machine. Its ports are injected: `loadGenerator`, `Scheduler`, `emit` and `now`. The ports and `ProducerError` (an `Error` carrying a `ProducerErrorCode`) live in the same module.
 
 ```
           load(wasmUrl)            start(run)              pause
  [idle] ───────────────► [ready] ─────────────► [running] ───────► [paused]
-    │  fail                ▲           ▲  start(run)  ◄───────────    │
-    ▼                      │           └──────────────── resume ──────┘
- [error] ── load (retry) ──┘                    start(run) from paused → running
+    │                                  ▲  start(run)  ◄───────────    │
+    │ fail                             └──────────────── resume ──────┘
+    ▼                                           start(run) from paused → running
+ [failed]  ◄── init or generation failure (from running)
+   terminal: recovery = a new worker (Retry, §5.3)
 ```
 
-- `start(run)` resets the aggregator, calls `generator.init(seed, count, updatesPerBatch)`, sets `currentRunId` and schedules ticks. It is valid from `ready`, `running` and `paused` (FR-S3).
+- `start(run)` builds a fresh `Run` (new aggregator, counters and ack state; creating it **is** the reset), calls `generator.init(seed, count, updatesPerBatch)` and schedules ticks. It is valid from `ready`, `running` and `paused` (FR-S3). Before the generator has loaded, it is rejected with a non-fatal `INVALID_COMMAND`.
+- The first batch arrives **one interval after start**, the same as after resume. The setting is the requested time *between* batches, and both paths use one schedule rule.
 - `pause()` cancels the pending timer. Generation is synchronous, so no batch is in flight. Then it emits `status: paused`.
 - `resume()` schedules the next tick at `now + interval`. There is **no catch-up** for the paused period (FR-D6).
-- **Tick:** `ptr = generate(n)`, `aggregator.ingest(view, n)`, then `seq++`. If the previous snapshot was acked, it emits a snapshot. Otherwise it marks `dirty` (conflation). On `ack`, if `dirty`, it emits the latest snapshot immediately.
-- **Scheduler:** drift-compensated `setTimeout` (`next = scheduledAt + interval`). If the engine falls behind by more than one interval, it reschedules from `now` and does not burst. This avoids a death spiral. It counts `lateTicks` for status.
-- Stats in each snapshot: `totalUpdates`, `batches`, `lastBatchGenMs` and `effectiveRate` (updates/s over a sliding 1 s EMA).
+- A repeated `pause`/`resume` only echoes the current status.
+- **Run fencing in the worker:** `pause`, `resume` and `ack` for any other `runId` are ignored. This mirrors the main-thread fencing (§4.2 principle 4).
+- **Tick:** `generate(n)`, then `aggregator.ingest(view, n)`, then `batches++` (the seq). If no snapshot is awaiting an ack, the tick publishes one immediately. Otherwise its batch waits and is folded into the next snapshot (conflation).
+- **Ack:** an `ack` for the published seq clears the wait. If batches arrived meanwhile, the latest snapshot is published at once. A new run never waits for the old run's ack.
+- **Failures** (`init` rejected, Wasm trap, aggregator range error) stop the scheduler and drop the generator. The engine emits a **fatal** error and accepts no further runs.
+- **Scheduler** (`TimerScheduler`, `scheduler.ts`):
+  - Drift-compensated `setTimeout` on a fixed grid (`dueAt += interval`).
+  - If a tick fires more than one interval late, it re-anchors at `now + interval` and reports `late` instead of bursting the missed ticks. This avoids a death spiral.
+  - It re-arms before calling the tick, so the tick can stop the schedule.
+- **Stats** in each snapshot (per run):
+  - `totalUpdates` and `batches`.
+  - `lastBatchMs`: generate plus ingest time.
+  - `updatesPerSecond`: measured over windows of at least 1 s of running time. A resume opens a new window, so paused time does not dilute the rate.
+  - `lateTicks`.
 
-**`WasmMarketGenerator` (adapter)** — `load(url)` uses `WebAssembly.instantiateStreaming(fetch(url))` and falls back to `arrayBuffer` + `instantiate` when the MIME type is wrong. It verifies `abi_version`/`update_stride` and maps error codes to typed errors such as `WASM_FETCH_FAILED`, `WASM_COMPILE_FAILED`, `ABI_MISMATCH` and `INIT_REJECTED`.
+**`loadWasmMarketGenerator` (adapter, `wasm-market-generator.ts`)** — fetches the module through an injectable `fetch`.
+- **Compilation:** it uses `WebAssembly.instantiateStreaming` when the response is `application/wasm`, and `arrayBuffer()` + `instantiate` for any other MIME type. Which branch runs is decided from `Content-Type`, so the body is never read twice.
+- **ABI check:** it requires `memory` and every exported function, and verifies `abi_version` and `update_stride`.
+- **Typed errors:** every failure is a `ProducerError`:
+  - `WASM_FETCH_FAILED`: network error or HTTP status.
+  - `WASM_COMPILE_FAILED`: the bytes are not Wasm.
+  - `ABI_MISMATCH`: missing exports or the wrong version or stride.
+  - `INIT_REJECTED`: a negative `init` code.
+  - `GENERATION_FAILED`: a null pointer from `generate`, reported with `last_error()`.
+- **Batches:** `generate(n)` returns a `Uint32Array` **view** into linear memory (zero-copy). The view is valid until the next call. A new view object is taken per batch (one small allocation per batch, never per update), so it stays correct even if memory grows.
 
 **`MarketAggregator`** — fixed arrays sized `instrumentCount`:
 - `last`, `bid`, `ask`, `bidQty`, `askQty` (Float64Array, NaN = no data yet)
@@ -392,7 +415,7 @@ Terminate the worker → spawn a new one → `load` → on `ready`, `startRun(ap
 
 ## 8. Cross-cutting concerns
 
-- **Performance:** the hot path never allocates. Typed-array views are reused and snapshot buffers are transferred, not cloned. Rendering is coalesced to rAF and there are no per-update `postMessage` calls. `track row.symbol` keeps DOM nodes stable. Zoneless signals mean only the affected bindings update. At most 50 rows means no virtualization is needed; it is listed as future work for larger universes.
+- **Performance:** the per-update hot path never allocates: the aggregator reads a zero-copy view of Wasm memory (one view object per batch). Snapshots are conflated to at most one in flight and are small (≤ 50 plain objects), so structured cloning is cheap. Rendering is coalesced to rAF and there are no per-update `postMessage` calls. `track row.symbol` keeps DOM nodes stable. Zoneless signals mean only the affected bindings update. At most 50 rows means no virtualization is needed; it is listed as future work for larger universes.
 - **Precision:** integer cents and an exact BigInt notional. The one division (VWAP) uses `decimal.js` with half-even rounding. Money is formatted from decimal strings. A unit test asserts `$101.50` for the worked example and exactness for large accumulations (§5.6).
 - **Error handling:** typed error codes. `worker.onerror` and `onmessageerror` map to the `error` state. Wasm traps (`RuntimeError`) are caught per tick, the engine stops, and it emits a fatal error.
 - **Security:** Render serves the security headers from `render.yaml`, which is stronger than a `<meta>` CSP because it covers `frame-ancestors` and applies before HTML parsing. The CSP is `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`. The other headers are HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a restrictive `Permissions-Policy`. There are no third-party runtime scripts, and dependency versions are pinned with a lockfile. `npm audit` and `cargo audit` run in CI (non-blocking at first).
@@ -636,7 +659,7 @@ Each step ends with a verifiable check and a commit, which keeps the development
 18. Add `tsconfig.worker.json` (`lib: ["es2022","webworker"]`) and register it in `angular.json` (the `ng g web-worker` approach). **The application builder does not type-check worker code** (Angular docs, "Known issues"). Add `tsc --noEmit -p tsconfig.worker.json` to `npm run lint` so worker code is held to the same strict typing as the app.
 19. `scheduler.ts` (drift-compensated, injectable clock) with tests using fake timers.
 20. `producer-engine.ts` with ports (`MarketGenerator`, `Scheduler`, `EventSink`). Tests cover start, tick, pause, resume without back-fill, start while paused, reset on start, conflation/ack, errors and late ticks.
-21. `wasm-market-generator.ts` adapter: load with streaming fallback, ABI checks, view refresh on memory growth and error mapping.
+21. `wasm-market-generator.ts` adapter: load with streaming fallback, ABI checks, a fresh zero-copy view per batch and error mapping. Tests run against the real compiled `.wasm` through a fake `fetch`.
 22. `market.worker.ts` entry: routing and validation.
 23. **Commit** `feat(worker): producer engine with conflation and run fencing`.
 
