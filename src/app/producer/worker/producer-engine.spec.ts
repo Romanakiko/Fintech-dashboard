@@ -1,42 +1,11 @@
 import type { InstrumentTotals } from '../../core/aggregator';
 import type { ProducerCommand, ProducerEvent, Seed } from '../../core/protocol';
 import type { ProducerSettings } from '../../core/settings';
+import { ManualScheduler } from '../../../testing/manual-scheduler';
 import { encodeUpdates } from '../../../testing/market-updates';
-import {
-  type MarketGenerator,
-  ProducerEngine,
-  ProducerError,
-  type Scheduler,
-} from './producer-engine';
+import { type MarketGenerator, ProducerEngine, ProducerError } from './producer-engine';
 
 type Snapshot = Extract<ProducerEvent, { type: 'snapshot' }>;
-
-/** Runs ticks only when the test calls fire(). */
-class ManualScheduler implements Scheduler {
-  intervalMs: number | null = null;
-  private tick: ((late: boolean) => void) | null = null;
-
-  get running(): boolean {
-    return this.tick !== null;
-  }
-
-  start(intervalMs: number, tick: (late: boolean) => void): void {
-    this.intervalMs = intervalMs;
-    this.tick = tick;
-  }
-
-  stop(): void {
-    this.intervalMs = null;
-    this.tick = null;
-  }
-
-  fire(late = false): void {
-    if (this.tick === null) {
-      throw new Error('The scheduler is not running');
-    }
-    this.tick(late);
-  }
-}
 
 /** Every update trades 1 unit at 100 cents; instruments are visited round-robin. */
 class FakeGenerator implements MarketGenerator {

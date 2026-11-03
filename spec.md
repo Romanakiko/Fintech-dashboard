@@ -131,7 +131,7 @@ The system covers these problems:
 │  MAIN THREAD (Angular 22, zoneless, signals)                                │
 │  ┌──────────────┐   ┌───────────────────┐   ┌──────────────────────────┐    │
 │  │ DashboardPage│◄──│   MarketStore     │◄──│ MarketProducerClient     │    │
-│  │ SettingsPage │──►│   SettingsStore   │──►│ (owns the single Worker) │    │
+│  │ SettingsPage │──►│ (run + settings)  │──►│ (owns the single Worker) │    │
 │  └──────────────┘   └───────────────────┘   └────────────┬─────────────┘    │
 │                                                         │ postMessage      │
 │                                       commands ▼        │ ▲ events         │
@@ -270,22 +270,28 @@ Build: `cargo build --release --target wasm32-unknown-unknown`, with `opt-level=
 
 ### 5.3 Main-thread services (`@Service`, root singletons)
 
-**`ProducerWorkerFactory`** (injection token) — `() => Worker`. The default creates `new Worker(new URL('./worker/market.worker', import.meta.url), { type: 'module' })`. Tests provide a `FakeWorker`.
+**`PRODUCER_WORKER_FACTORY`** (injection token, `producer-worker.factory.ts`) — `() => Worker`. The default creates `new Worker(new URL('./worker/market.worker', import.meta.url), { type: 'module' })`, the exact form the application builder recognises and bundles as a separate chunk. Tests provide a `FakeWorker`, because jsdom has no `Worker`.
 
-**`MarketProducerClient`** — owns the **single** worker for the app's lifetime. Navigation cannot create another one because the client is a root singleton, not a component. It is created eagerly through `provideAppInitializer` so data flows before the first page renders.
-- `load()` posts `{type:'load', wasmUrl}`. The wasm URL is resolved with `new URL('wasm/market_gen.wasm', document.baseURI)`, so it stays correct under any `base href`.
-- It translates the commands `start/pause/resume/ack` and exposes `events$` as an Observable, bridged to signals in the store.
-- `retry()` terminates the broken worker, creates a new one and replays `load` plus `start(currentRun)`.
-- `DestroyRef.onDestroy` → `worker.terminate()` (FR-P8).
+**`MarketProducerClient`** (`market-producer.client.ts`) — the transport. It owns the **single** worker. Navigation cannot create another one because the client is a root singleton, not a component.
+- `connect()` terminates any current worker, creates a new one and posts `{type:'load', wasmUrl}`. The wasm URL is resolved with `new URL('wasm/market_gen.wasm', document.baseURI)`, so it stays correct under any `base href`.
+- `send(command)` posts a command. `events` is an Observable, because events are a stream and not state. The store turns it into signals.
+- Failures of the worker itself become fatal `WORKER_CRASHED` events: `new Worker` throwing (for example under a CSP), `onerror` and `onmessageerror`.
+- Any fatal error releases the worker at once, since it cannot recover. Handlers are detached before `terminate()`, so messages already queued from a replaced worker never reach the app.
+- `DestroyRef.onDestroy` releases it too (FR-P8).
 
-**`MarketStore`** — the state for the dashboard:
-- `runId: Signal<number>` (owned here; incremented on apply)
-- `status: Signal<ProducerStatus>`, `error: Signal<ProducerError | null>`, `stats: Signal<ProducerStats>`
-- `rows: Signal<readonly InstrumentRow[]>`, built from the latest snapshot. Before the first snapshot, rows contain empty values (FR-D3).
-- `applySnapshot(evt)` **drops** the event if `evt.runId !== runId()` (fencing). Otherwise it stores the event in a pending slot. A `requestAnimationFrame` flush commits at most one snapshot per frame to the signal and posts `ack` (coalescing plus backpressure).
-- `pause() / resume() / startRun(settings)`. `startRun` increments `runId`, resets rows to empty for `settings.instrumentCount` synchronously (FR-S3 reset), then sends `start`.
+**`MarketStore`** (`state/market.store.ts`) — the state of the active run and the only owner of run ids. It is created eagerly through `provideAppInitializer` so data flows before the first page renders. The initializer does not wait for the Wasm, so a slow or failing load cannot block the first render.
+- Read-only signals: `runId`, `settings` (of the active run), `status` (`initializing | running | paused | error`), `error`, `stats` and `rows`.
+- `rows` is a `computed` from the latest totals, using `symbolOf` and `computeMetrics`. Before the first snapshot it holds empty values (FR-D3), produced by a fresh `MarketAggregator` so the "no data" shape has one definition.
+- **Fencing:** `snapshot` and `status` events are dropped unless `event.runId === runId()`. Errors are not fenced: a fatal error ends the worker whichever run it hit.
+- **Coalescing and backpressure:** a current snapshot goes to a pending slot, and one `requestAnimationFrame` (through the injectable `REQUEST_FRAME` token) commits the latest to the signals and posts `ack`. The worker publishes at the pace the UI renders. In a hidden tab rAF stops, so generation continues, totals stay exact, and the latest snapshot arrives when the tab returns.
+- `connect()` starts the producer, and is also the Retry action. On `ready` it starts a run with the current settings. A run started this way has a new `runId` and empty rows, because a new worker has no totals to continue from.
+- `startRun(settings)` (Apply) synchronously increments `runId`, stores the settings, resets rows and stats, and discards a pending snapshot (FR-S3). What happens next depends on the status:
+  - `running` or `paused`: it sends `start` with a new random seed and sets `running` at once.
+  - `initializing`: it waits, and `ready` starts the latest settings.
+  - `error`: it reconnects, so Apply also recovers from a failure.
+- `pause()` / `resume()` send the command, and `status` changes when the worker confirms.
 
-**`SettingsStore`** — `applied: Signal<ProducerSettings>` (defaults on boot), `apply(settings)` → `MarketStore.startRun`. Domain constants (`DEFAULT_SETTINGS`, `SETTINGS_LIMITS`) live in `core/settings.ts` and are shared with the worker validator.
+There is deliberately no separate `SettingsStore`. The applied settings are the active run's settings, and Retry and the row reset need them inside `MarketStore` anyway. A second store would hold a copy plus a pass-through to `startRun`. The Settings page reads `market.settings()` and calls `market.startRun(value)`. Domain constants (`DEFAULT_SETTINGS`, `SETTINGS_LIMITS`) live in `core/settings.ts` and are shared with the worker validator.
 
 ### 5.4 UI components
 
@@ -395,9 +401,9 @@ Symbols are produced by a deterministic table of 50 four-letter symbols in `core
 ## 7. Key flows
 
 **Boot**
-1. The app initializer creates `MarketProducerClient`, which spawns the worker → `load(wasmUrl)`.
+1. The app initializer calls `MarketStore.connect()`, and the client spawns the worker → `load(wasmUrl)`. The page renders without waiting.
 2. The worker fetches and instantiates the Wasm and checks the ABI → `ready`. On failure → `error(fatal)` and the UI shows the banner with Retry.
-3. On `ready`, `MarketStore.startRun(DEFAULT_SETTINGS)` sets `runId=1`, sets empty rows and sends `start`.
+3. On `ready`, `MarketStore` starts a run with the current settings (defaults at boot): `runId=1`, empty rows, `start`.
 
 **Steady state**
 Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot (if acked) → main thread pending slot → rAF flush → signal set → table re-renders → `ack`.
@@ -409,7 +415,7 @@ Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot
 `runId++`, rows reset synchronously → `start{runId, settings, seed}` → the engine resets the aggregator and Wasm state and reschedules. Any snapshot of the old run already in flight arrives with the old `runId` and is **dropped** by the store.
 
 **Retry after error**
-Terminate the worker → spawn a new one → `load` → on `ready`, `startRun(applied settings)`.
+`MarketStore.connect()` → spawn a new worker (the failed one was released when the error arrived) → `load` → on `ready`, a new run with the current settings. Applying settings while in the error state does the same with the new settings.
 
 ---
 
@@ -435,7 +441,9 @@ Terminate the worker → spawn a new one → `load` → on `ready`, `startRun(ap
 | Metrics (pure) | Vitest | Worked example: LTP $102, volume 40, VWAP `"10150.0000"` cents shown as $101.50, spread $0.04, OBI 0.20. Zero denominators give unavailable values. The initial state is unavailable with volume 0. **Isolation**: trades on ALFA don't affect BETA. Large-sum exactness (BigInt carry). |
 | Formatters | Vitest | Currency, signed imbalance, NaN → `—`. |
 | ProducerEngine | Vitest + fake generator + fake scheduler/clock | Start generates per tick. Pause stops ticks. Resume does not back-fill (advance fake time by 10 intervals while paused → 0 batches). Start-while-paused → running. A start resets the aggregator. Conflation emits nothing until ack. A drift/late tick does not burst. A generator error gives a fatal error. |
-| MarketStore | Vitest + fake client | Stale `runId` snapshot is **rejected**. `startRun` resets rows and volume to 0. Pause/resume send commands and preserve rows. rAF coalescing (fake rAF) applies the last of N snapshots. |
+| MarketProducerClient | Vitest + `FakeWorker` | One worker, replaced on reconnect, late events of a replaced worker ignored, terminated on destroy. `new Worker` throwing, `onerror` and `onmessageerror` become fatal errors. |
+| MarketStore | Vitest + `FakeWorker` + manual frames | Stale `runId` snapshot and status are **rejected**. `startRun` resets rows and volume to 0, also discarding a snapshot waiting for a frame. Pause/resume send commands and preserve rows. rAF coalescing applies the last of N snapshots. Apply during startup and after a fatal error. Retry. |
+| Market data flow | Vitest: store + real engine + compiled Wasm, thread boundary simulated with `structuredClone` | **Every generated trade is counted** however few frames render: the final rows equal an independent replay of the same seed. Old-run results never reach the new run. Totals survive pause/resume without back-fill. |
 | Settings | Vitest + TestBed | Defaults. Validation (required, non-integer `1.5`, below min, above max, at the boundaries). Editing does not call the store. Apply with valid input calls `startRun` once with the new settings. Apply while invalid is blocked. Apply while paused leads to running. |
 | Components | Vitest + TestBed + axe-core | The table renders unavailable values pre-data. The Pause button toggles `aria-pressed`. The error banner shows Retry. No AXE violations. |
 | Navigation | Vitest + RouterTestingHarness | Navigate dashboard → settings → dashboard: the worker factory was called **once** and the paused state is preserved. |
@@ -580,7 +588,7 @@ Fintech-dashboard/
 │  │  ├─ worker/{market.worker.ts, producer-engine.ts, wasm-market-generator.ts, scheduler.ts}
 │  │  ├─ producer-worker.factory.ts
 │  │  └─ market-producer.client.ts
-│  ├─ state/{market.store.ts, settings.store.ts}
+│  ├─ state/{market.store.ts, request-frame.ts}
 │  ├─ features/
 │  │  ├─ dashboard/{dashboard.page.ts, market-table.ts, producer-controls.ts}
 │  │  └─ settings/{settings.page.ts}
@@ -664,11 +672,11 @@ Each step ends with a verifiable check and a commit, which keeps the development
 23. **Commit** `feat(worker): producer engine with conflation and run fencing`.
 
 ### Phase 4 — Main-thread integration (½ day)
-24. `ProducerWorkerFactory` token and `MarketProducerClient` (single worker, `DestroyRef` cleanup, retry).
-25. `MarketStore` (runId fencing, rAF coalescing, ack, pause/resume/startRun) with tests: stale snapshot rejection, reset on startRun, pause/resume, coalescing.
-26. `SettingsStore` (applied settings, apply → startRun) with tests.
-27. Wire up `provideAppInitializer` (create the client, start the run on `ready`) and confirm zoneless change detection is configured.
-28. **Commit** `feat(state): market and settings stores`.
+24. `PRODUCER_WORKER_FACTORY` token and `MarketProducerClient` (single worker, `DestroyRef` cleanup, reconnect).
+25. `MarketStore` (runId fencing, rAF coalescing, ack, connect/pause/resume/startRun) with tests: stale snapshot rejection, reset on startRun, pause/resume, coalescing, retry.
+26. Applied settings live in `MarketStore.settings`; there is no separate `SettingsStore` (§5.3). Integration test of the store with the real engine and Wasm.
+27. Wire up `provideAppInitializer` (connect; the run starts on `ready`). Zoneless needs no configuration: it is the default since Angular 21, and the app has no `zone.js` or `provideZoneChangeDetection`.
+28. **Commit** `feat(state): market store and worker client`.
 
 ### Phase 5 — UI (1 day)
 29. Routes: lazy `loadComponent` for `dashboard` and `settings`, a `''` redirect, a `**` fallback and page titles.
@@ -716,7 +724,7 @@ Each step ends with a verifiable check and a commit, which keeps the development
 | Pause/Resume without back-fill | FR-D6 | `ProducerEngine` | producer-engine.spec, market.store.spec |
 | Producer status | FR-D7 | `ProducerStatusComponent` | component spec |
 | Validated integer settings with ranges | FR-S1/4 | Settings page, `validateSettings` | settings.spec |
-| Editing doesn't affect producer, Apply resets and starts | FR-S2/3 | `SettingsStore`, `MarketStore.startRun` | settings.page.spec, market.store.spec |
+| Editing doesn't affect producer, Apply resets and starts | FR-S2/3 | `MarketStore.startRun` | settings.page.spec, market.store.spec |
 | Navigation preserves the run, single producer | FR-N2 | Root `MarketProducerClient` | navigation.spec |
 | Old run results rejected | FR-S3, ADR-5 | runId fencing | market.store.spec, producer-engine.spec |
 | Wasm generates updates with state, evolution and invariants | FR-P1–P5 | `wasm/market-gen` | cargo tests, wasm contract test |
