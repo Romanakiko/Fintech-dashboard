@@ -1,0 +1,73 @@
+:host {
+  display: grid;
+  gap: var(--space-4);
+  max-width: 36rem;
+}
+
+.lead {
+  margin: 0;
+  color: var(--color-text-muted);
+}
+
+.settings {
+  display: grid;
+  gap: var(--space-6);
+  padding: var(--space-6);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.field__label {
+  font-weight: 600;
+}
+
+.field__hint,
+.field__error {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.field__hint {
+  color: var(--color-text-muted);
+}
+
+.field__error {
+  font-weight: 600;
+  color: var(--color-danger);
+}
+
+.field__input {
+  width: 10rem;
+  min-height: 2.5rem;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-control-border);
+  border-radius: var(--radius);
+
+  // Not colour alone: an invalid field also gets a thicker border and an error message.
+  &[aria-invalid='true'] {
+    border: 2px solid var(--color-danger);
+  }
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+// Always rendered, even while empty: a live region that only appears together with its
+// text is not reliably announced. The reserved line also avoids a layout shift on Apply.
+.confirmation {
+  min-height: 1.5em;
+  margin: 0;
+}

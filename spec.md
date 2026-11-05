@@ -297,21 +297,23 @@ There is deliberately no separate `SettingsStore`. The applied settings are the 
 
 | Component | Responsibility | Notes |
 |---|---|---|
-| `AppShell` (`App`) | Header, primary nav (`routerLink` with `ariaCurrentWhenActive`), producer status badge, `<router-outlet>` | Skip-link to `<main>`. Focus moves to the page `<h1>` on navigation. |
-| `ProducerStatusComponent` | Badge with state, run #, active settings, effective rate | `role="status"` / `aria-live="polite"`. It announces state changes only, not the ticking numbers. |
-| `DashboardPage` (lazy) | Composes the controls and the table | Route title "Dashboard". |
-| `ProducerControlsComponent` | Pause/Resume button | A single toggle `<button aria-pressed>`. Disabled while initializing or in error. |
-| `MarketTableComponent` | `<table>` with `<caption>`, `<th scope="col">`, `@for (row of rows(); track row.symbol)` | Numeric cells right-aligned with tabular-nums. "Unavailable" is rendered as `—` with visually-hidden text "not available". Optional up/down tick flash, disabled under `prefers-reduced-motion`. |
-| `SettingsPage` (lazy) | Signal Forms form with three integer fields, Apply and "Reset to defaults" | Inline errors linked with `aria-describedby`. After Apply, an `aria-live` confirmation is shown. The form is initialised from `applied()` and does not affect the producer until Apply. |
-| `ErrorBanner` | Shows the init/runtime error with code, message and **Retry** | `role="alert"`. |
+| `AppShell` (`App`) | Header, primary nav (`routerLink` with `ariaCurrentWhenActive`), producer status badge, error banner, `<router-outlet>` | Skip link to the main content. It handles the click itself, because a plain `#main` href resolves against `<base href>` and would reload the app. After every client-side navigation (not the first load), focus moves to the new page's `<h1>` (`tabindex="-1"`), as a full page load would. |
+| `ProducerStatusBadge` (`layout/producer-status.ts`) | Lifecycle state and run number, in the header of every page | `role="status"` (a polite live region): it announces state and run changes only. The fast-changing numbers live in the dashboard summary and are not announced. A coloured dot is decorative; the state is always written out. |
+| `DashboardPage` (lazy) | Heading, Pause/Resume, run summary (`<dl>`: instruments, batch settings, updates this run, effective rate) and the table | Route title "Dashboard – Realtime Fintech Dashboard". The rate shows 0 unless running, because the last measured rate goes stale once generation stops. |
+| `ProducerControls` | Pause/Resume button | One `<button>` whose label says what it will do. Deliberately **no `aria-pressed`**: a toggle whose label also changes is announced as "Resume, pressed", which misleads. Disabled while starting or failed. The label follows the state the worker confirms. |
+| `MarketTable` | `<table>` with `<caption>`, `<th scope="col">`, row headers `<th scope="row">`, `@for (row of cells(); track row.symbol)` | A presentational component (`rows` input); formatting and money rounding happen only here, in a `computed`. Numeric cells right-aligned with tabular numbers. "Unavailable" renders as a visible `—` (`aria-hidden`) plus visually hidden "not available", because screen readers skip or misread a bare dash. A focusable, labelled scroll region keeps the table usable on narrow screens. The optional tick flash was left out: at high rates it is noise, and the task does not ask for it. |
+| `SettingsPage` (lazy) | Signal Forms form with three integer fields, Apply and "Reset to defaults" | See §5.5. Errors appear as soon as a field is edited (dirty) or left (touched), so a disabled Apply always has a visible reason. Each error is linked with `aria-describedby` together with the field hint, and the input gets `aria-invalid`. After Apply, a `role="status"` confirmation is shown until the next edit. |
+| `ErrorBanner` (`layout/error-banner.ts`) | A plain-language headline per error code, the technical message and code, and **Retry** for fatal errors only | `role="alert"`. Placed at the top of `<main>`, so it is visible on every page. Retry calls `MarketStore.connect()`. |
 
 **Formatting** (`core/format.ts`, pure, tested): `formatMoney(minorUnits: number | string | null)`, `formatSpread`, `formatImbalance(v)` → `+0.20` / `−0.35` / `0.00`, `formatVolume` (grouping). Each one returns `'—'` for unavailable values. Money is converted from cents to a decimal string with `decimal.js` (`.div(100).toFixed(2, ROUND_HALF_EVEN)`). The string goes to `Intl.NumberFormat.format()`, which formats decimal strings exactly (Intl.NumberFormat v3). `Intl.NumberFormat` instances are cached.
 
 ### 5.5 Settings validation (Signal Forms)
 
-- Model: `signal<ProducerSettings>({...applied})`, wrapped in `form(model, schema)`.
-- Schema per field: `required`, `min`, `max` and a custom `integer` validator. Inputs are `type="number"` with `step="1"` and `inputmode="numeric"`.
-- The same rules exist as a pure `validateSettings(s): ValidationResult` in `core/settings.ts`. The worker validator and unit tests reuse it, so the rules have one source of truth.
+- **Model:** `signal<SettingsDraft>({...market.settings()})`, where `SettingsDraft = Record<SettingKey, number | null>`, wrapped in `form(draft, settingsSchema, { submission })`. The draft is nullable because Signal Forms writes `null` for an emptied number input. `FormRoot` handles submission: it marks every field touched and runs the action only when the form is valid. The action narrows the draft to `ProducerSettings` with the same `isValidSettings` guard the worker uses, then calls `market.startRun`.
+- **Rules per field:** the built-in `required`, `min` and `max`, with limits taken from `SETTINGS_LIMITS`, plus a custom `integer` rule (`validate`). Messages name the field ("Instrument count must be 50 or less."). Inputs are `type="number"` with `step="1"` and `inputmode="numeric"`. A half-typed value such as `1e` surfaces as Signal Forms' own `parse` error.
+- **Why built-in rules rather than calling `validateSetting` from one custom rule:** the template compiler forbids `min`, `max`, `required` and `name` on an element with `[formField]`, even as static attributes. Only the built-in rules set those native attributes, which assistive technology uses. To keep one source of truth anyway, a unit test checks that the form accepts exactly what `validateSetting` (and therefore the worker) accepts, for each field at and around both bounds, for fractions, `null` and `NaN`.
+- **Apply** is enabled exactly when the form is valid (§17). Re-applying the same settings starts a fresh run.
+- **Known library behaviour:** each field keeps its raw input in a per-field control value that syncs into the shared model separately. If two sibling fields receive `input` events within one synchronous task, only the first edit survives. Keyboard and pointer input cannot do this (every keystroke is its own task), so users are unaffected. Scripts that fill several fields at once (automation, some autofill tools) must yield between fields.
 
 ### 5.6 Money and numeric precision — decimal library analysis
 
@@ -424,8 +426,9 @@ Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot
 - **Performance:** the per-update hot path never allocates: the aggregator reads a zero-copy view of Wasm memory (one view object per batch). Snapshots are conflated to at most one in flight and are small (≤ 50 plain objects), so structured cloning is cheap. Rendering is coalesced to rAF and there are no per-update `postMessage` calls. `track row.symbol` keeps DOM nodes stable. Zoneless signals mean only the affected bindings update. At most 50 rows means no virtualization is needed; it is listed as future work for larger universes.
 - **Precision:** integer cents and an exact BigInt notional. The one division (VWAP) uses `decimal.js` with half-even rounding. Money is formatted from decimal strings. A unit test asserts `$101.50` for the worked example and exactness for large accumulations (§5.6).
 - **Error handling:** typed error codes. `worker.onerror` and `onmessageerror` map to the `error` state. Wasm traps (`RuntimeError`) are caught per tick, the engine stops, and it emits a fatal error.
+- **Security, no inline scripts:** critical-CSS inlining is turned off in the production build (`optimization.styles.inlineCritical: false`). It loads the stylesheet through an inline `onload` handler, which `script-src 'self'` blocks; the page would then keep `media="print"` on the global stylesheet and render unstyled. This was found by the real-browser check in Phase 5. With it off, `index.html` contains only `<script src>` and `<link rel="stylesheet">`, as Angular's security guide recommends for static hosts without per-response nonces. The global CSS is about 2 kB, so inlining gained almost nothing. Component styles are `<style>` elements, which `style-src 'unsafe-inline'` allows.
 - **Security:** Render serves the security headers from `render.yaml`, which is stronger than a `<meta>` CSP because it covers `frame-ancestors` and applies before HTML parsing. The CSP is `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`. The other headers are HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a restrictive `Permissions-Policy`. There are no third-party runtime scripts, and dependency versions are pinned with a lockfile. `npm audit` and `cargo audit` run in CI (non-blocking at first).
-- **Accessibility:** AXE checks in component tests (`axe-core` run against rendered fixtures), a semantic table, visible focus styles, contrast tokens checked against AA, and reduced-motion support. Status changes are announced politely; the high-frequency numbers are not announced.
+- **Accessibility:** AXE checks in component tests (`axe-core` run against rendered fixtures), a semantic table, visible focus styles, colour tokens checked against AA by `design-tokens.spec.ts`, which reads `styles.scss` (every text pair ≥ 4.5:1 and every control border and focus ring ≥ 3:1, in both themes), and no motion at all, so nothing needs to be reduced. Status changes are announced politely; the high-frequency numbers are not announced.
 - **Observability (lightweight):** producer stats panel (rate, gen time, late ticks). `ErrorHandler` via `provideBrowserGlobalErrorListeners`. A `console` logger with levels sits behind a `Logger` service and can later be swapped for Sentry or OpenTelemetry.
 - **Code quality:** TS `strict`, ESLint (`angular-eslint`), Prettier, `cargo fmt` and `cargo clippy -D warnings`. Conventional commits.
 
@@ -445,8 +448,8 @@ Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot
 | MarketStore | Vitest + `FakeWorker` + manual frames | Stale `runId` snapshot and status are **rejected**. `startRun` resets rows and volume to 0, also discarding a snapshot waiting for a frame. Pause/resume send commands and preserve rows. rAF coalescing applies the last of N snapshots. Apply during startup and after a fatal error. Retry. |
 | Market data flow | Vitest: store + real engine + compiled Wasm, thread boundary simulated with `structuredClone` | **Every generated trade is counted** however few frames render: the final rows equal an independent replay of the same seed. Old-run results never reach the new run. Totals survive pause/resume without back-fill. |
 | Settings | Vitest + TestBed | Defaults. Validation (required, non-integer `1.5`, below min, above max, at the boundaries). Editing does not call the store. Apply with valid input calls `startRun` once with the new settings. Apply while invalid is blocked. Apply while paused leads to running. |
-| Components | Vitest + TestBed + axe-core | The table renders unavailable values pre-data. The Pause button toggles `aria-pressed`. The error banner shows Retry. No AXE violations. |
-| Navigation | Vitest + RouterTestingHarness | Navigate dashboard → settings → dashboard: the worker factory was called **once** and the paused state is preserved. |
+| Components | Vitest + TestBed + axe-core | The table renders unavailable values pre-data, announced as "not available". The Pause/Resume label follows the confirmed state and the button is disabled while starting. The error banner explains each failure and offers Retry only when the producer is down. Settings: every validation message, `aria-invalid`/`aria-describedby`, editing has no effect, Apply starts a new run (also when paused), confirmation, reset to defaults, and form rules ≡ producer rules. No axe violations. Colour contrast is checked by `design-tokens.spec.ts`, because axe cannot measure it under jsdom. |
+| Navigation | Vitest + TestBed with the real `appConfig` | Navigate dashboard → settings → dashboard: the worker factory was called **once** and the paused state is preserved. |
 
 There are no real-time waits: all timing goes through injected `Scheduler`/`Clock` or `vi.useFakeTimers()`.
 
@@ -681,10 +684,10 @@ Each step ends with a verifiable check and a commit, which keeps the development
 ### Phase 5 — UI (1 day)
 29. Routes: lazy `loadComponent` for `dashboard` and `settings`, a `''` redirect, a `**` fallback and page titles.
 30. App shell: header, nav, skip link, status component, error banner and focus management on navigation.
-31. Dashboard: `ProducerControls` and `MarketTable`, responsive layout (horizontal scroll container for the table on narrow screens), tabular numbers and reduced-motion-safe tick flash.
+31. Dashboard: `ProducerControls` and `MarketTable`, responsive layout (horizontal scroll container for the table on narrow screens) and tabular numbers. The optional tick flash was left out (§5.4).
 32. Settings page with Signal Forms: integer, min/max and required validation; Apply; Reset to defaults; live confirmation. Tests for validation, the "editing has no effect" rule and Apply behaviour.
 33. Component tests with axe-core, plus a navigation test that checks the worker factory was called once and state is preserved.
-34. Design tokens (CSS custom properties), light/dark themes and an AA contrast check.
+34. Design tokens (CSS custom properties), light/dark themes and an AA contrast check. Production build without critical-CSS inlining, so the CSP needs no inline scripts (§8).
 35. **Commit** `feat(ui): dashboard and settings pages`.
 
 ### Phase 6 — Hardening (½ day)
@@ -717,15 +720,15 @@ Each step ends with a verifiable check and a commit, which keeps the development
 
 | Requirement (task) | Spec | Implementation | Tests |
 |---|---|---|---|
-| Table with 5 metrics | FR-D1/2 | `MarketTableComponent`, `metrics.ts` | metrics.spec, market-table.spec |
+| Table with 5 metrics | FR-D1/2 | `MarketTable`, `metrics.ts` | metrics.spec, market-table.spec |
 | Cumulative volume and VWAP, every trade counted once | FR-D2, NFR-2 | `MarketAggregator` | aggregator.spec |
 | Unavailable before data and on zero denominators | FR-D3/4 | `metrics.ts`, `format.ts` | metrics.spec, format.spec |
 | Currency and imbalance formats | FR-D5 | `format.ts` | format.spec |
 | Pause/Resume without back-fill | FR-D6 | `ProducerEngine` | producer-engine.spec, market.store.spec |
-| Producer status | FR-D7 | `ProducerStatusComponent` | component spec |
-| Validated integer settings with ranges | FR-S1/4 | Settings page, `validateSettings` | settings.spec |
+| Producer status | FR-D7 | `ProducerStatusBadge`, dashboard summary | producer-status.spec, dashboard.page.spec |
+| Validated integer settings with ranges | FR-S1/4 | `SettingsPage` schema, `validateSetting` | settings.spec, settings.page.spec |
 | Editing doesn't affect producer, Apply resets and starts | FR-S2/3 | `MarketStore.startRun` | settings.page.spec, market.store.spec |
-| Navigation preserves the run, single producer | FR-N2 | Root `MarketProducerClient` | navigation.spec |
+| Navigation preserves the run, single producer | FR-N2 | Root `MarketProducerClient` | app.spec |
 | Old run results rejected | FR-S3, ADR-5 | runId fencing | market.store.spec, producer-engine.spec |
 | Wasm generates updates with state, evolution and invariants | FR-P1–P5 | `wasm/market-gen` | cargo tests, wasm contract test |
 | Worker hosts Wasm | FR-P6 | `market.worker.ts` | engine spec, manual |
@@ -747,7 +750,9 @@ Each step ends with a verifiable check and a commit, which keeps the development
 | Angular worker bundling of shared `core/` code | Build errors | Keep `core/` free of Angular imports. Use a dedicated `tsconfig.worker.json`. |
 | Worker code is not type-checked by the Angular application builder | Type errors reach runtime | An explicit `tsc --noEmit -p tsconfig.worker.json` in `lint`, which CI runs. Engine logic lives in modules that specs also import, so they are type-checked by the test build too. |
 | SPA deep links 404 on the host | Broken refresh on `/settings` | Render `routes` rewrite `/* → /index.html`. The wasm URL is resolved against `document.baseURI`. |
-| Signal Forms API differences between minor versions | Rework | Pin the Angular version. Verify the API against the current docs before implementation. |
+| Signal Forms API differences between minor versions | Rework | Pin the Angular version. Verify the API against the current docs before implementation (done in Phase 5: `[formField]`, `FormRoot`, `submission`). |
+| Signal Forms loses all but the first of several sibling-field edits made in one synchronous task | Scripted fills drop values | Not reachable with keyboard or pointer input. Automation yields between fields (§5.5). |
+| Critical-CSS inlining adds an inline `onload` script that the CSP blocks | Unstyled page in production | Turned off in the production build (§8). Verified in headless Chrome against the production build with the planned CSP (no violations, no inline script in `index.html`); that check moves into the repo in Phase 6 (step 38). |
 | A detached Wasm memory view after growth | Silent corruption or crash | Pre-allocate at `init`. Re-create the view when `memory.buffer` identity changes. Cover this with a test. |
 | Floating-point drift in VWAP | Wrong numbers | Exact integer/BigInt notional. Divide only at snapshot time. |
 

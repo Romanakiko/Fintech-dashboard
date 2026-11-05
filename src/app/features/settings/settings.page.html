@@ -1,0 +1,46 @@
+<h1 tabindex="-1">Producer settings</h1>
+
+<p class="lead">
+  Changes take effect only when you apply them. Applying starts a new run: the current values and
+  totals are cleared, and generation starts even if it is paused.
+</p>
+
+<form class="settings" [formRoot]="settingsForm">
+  @for (field of fields; track field.key) {
+    @let state = settingsForm[field.key]();
+    @let showError = state.invalid() && (state.dirty() || state.touched());
+    <div class="field">
+      <label class="field__label" [for]="field.key">{{ field.label }}</label>
+      <p class="field__hint" [id]="field.key + '-hint'">
+        {{ field.hint }} A whole number from {{ quantity(limits[field.key].min) }} to
+        {{ quantity(limits[field.key].max) }}.
+      </p>
+      @if (showError) {
+        <p class="field__error" [id]="field.key + '-error'">
+          {{ errorText(field, state.errors()) }}
+        </p>
+      }
+      <input
+        class="field__input"
+        type="number"
+        step="1"
+        inputmode="numeric"
+        [id]="field.key"
+        [formField]="settingsForm[field.key]"
+        [attr.aria-invalid]="showError"
+        [attr.aria-describedby]="
+          field.key + '-hint' + (showError ? ' ' + field.key + '-error' : '')
+        "
+      />
+    </div>
+  }
+
+  <div class="actions">
+    <button type="submit" class="button" [disabled]="settingsForm().invalid()">Apply</button>
+    <button type="button" class="button button--secondary" (click)="resetToDefaults()">
+      Reset to defaults
+    </button>
+  </div>
+
+  <p class="confirmation" role="status">{{ confirmation() }}</p>
+</form>

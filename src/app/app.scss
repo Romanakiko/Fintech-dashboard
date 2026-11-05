@@ -1,0 +1,74 @@
+.skip-link {
+  position: absolute;
+  top: var(--space-2);
+  left: var(--space-2);
+  z-index: 1;
+  padding: var(--space-2) var(--space-4);
+  color: var(--color-on-accent);
+  background: var(--color-accent);
+  border-radius: var(--radius);
+  transform: translateY(-200%);
+
+  &:focus {
+    transform: none;
+  }
+}
+
+.app-header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-header__inner,
+.app-main {
+  max-width: var(--content-width);
+  margin: 0 auto;
+  padding: var(--space-3) var(--space-4);
+}
+
+.app-header__inner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-6);
+  align-items: center;
+}
+
+.app-brand {
+  margin: 0;
+  font-weight: 700;
+}
+
+.app-nav {
+  display: flex;
+  gap: var(--space-4);
+
+  a {
+    padding: var(--space-1) 0;
+    color: var(--color-text);
+    text-decoration: none;
+    border-bottom: 3px solid transparent;
+
+    &:hover {
+      color: var(--color-accent);
+    }
+  }
+
+  // Not colour alone: the active page also gets a heavier weight and an underline.
+  .is-active {
+    font-weight: 600;
+    border-bottom-color: var(--color-accent);
+  }
+}
+
+app-producer-status {
+  margin-left: auto;
+}
+
+// Not a grid: the always-present banner host and <router-outlet> would each add a gap.
+.app-main {
+  padding-block: var(--space-6);
+
+  &:focus {
+    outline: none;
+  }
+}
