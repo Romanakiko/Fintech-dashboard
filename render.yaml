@@ -1,0 +1,46 @@
+# Render Blueprint (spec §10.2). Applied only when the service is created through
+# New → Blueprint. scripts/serve-dist.mjs reads the same routes and headers, so local
+# checks run against exactly what Render serves.
+services:
+  - type: web
+    runtime: static
+    name: fintech-dashboard
+    branch: main
+    autoDeployTrigger: checksPass # deploy only after the GitHub CI checks pass
+    buildCommand: bash scripts/render-build.sh
+    staticPublishPath: dist/Fintech-dashboard/browser # case-sensitive on Render (Linux)
+    envVars:
+      - key: SKIP_INSTALL_DEPS # the build script runs `npm ci` itself
+        value: 'true'
+    routes:
+      - type: rewrite # SPA deep links: /settings → index.html
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: Content-Security-Policy
+        value: "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+      - path: /*
+        name: Strict-Transport-Security
+        value: max-age=63072000; includeSubDomains
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
+      - path: /*
+        name: Permissions-Policy
+        value: camera=(), microphone=(), geolocation=()
+      # Revalidate by default. This covers index.html (served at every route through the
+      # rewrite, so a /index.html rule would miss it) and the Wasm module (a fixed name, so a
+      # cached copy could pair an old module with new JS). A failed or corrupt response then
+      # cannot stay cached, and Retry fetches again. The 2 kB stylesheet is simply revalidated.
+      - path: /*
+        name: Cache-Control
+        value: no-cache
+      # Content-hashed bundles. The more specific rule comes last; serve-dist applies the
+      # last match, and Phase 7 checks the live headers (spec §13, step 44).
+      - path: /*.js
+        name: Cache-Control
+        value: public, max-age=31536000, immutable

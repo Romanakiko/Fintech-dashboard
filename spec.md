@@ -251,10 +251,10 @@ Build: `cargo build --release --target wasm32-unknown-unknown`, with `opt-level=
   - `lateTicks`.
 
 **`loadWasmMarketGenerator` (adapter, `wasm-market-generator.ts`)** — fetches the module through an injectable `fetch`.
-- **Compilation:** it uses `WebAssembly.instantiateStreaming` when the response is `application/wasm`, and `arrayBuffer()` + `instantiate` for any other MIME type. Which branch runs is decided from `Content-Type`, so the body is never read twice.
+- **Compilation:** it uses `WebAssembly.instantiateStreaming` when the response is `application/wasm`, and `arrayBuffer()` + `instantiate` for any other MIME type except `text/html`, which is rejected first (see `WASM_FETCH_FAILED` below). Which branch runs is decided from `Content-Type`, so the body is never read twice.
 - **ABI check:** it requires `memory` and every exported function, and verifies `abi_version` and `update_stride`.
 - **Typed errors:** every failure is a `ProducerError`:
-  - `WASM_FETCH_FAILED`: network error or HTTP status.
+  - `WASM_FETCH_FAILED`: network error, HTTP status, or an HTML page in place of the module. The SPA rewrite (§10.2) answers a missing file with `index.html` and HTTP 200, which would otherwise surface as a cryptic compile error ("expected magic word … found 3c 21 64 6f"). Found in Phase 6.
   - `WASM_COMPILE_FAILED`: the bytes are not Wasm.
   - `ABI_MISMATCH`: missing exports or the wrong version or stride.
   - `INIT_REJECTED`: a negative `init` code.
@@ -344,13 +344,21 @@ So money in this system needs exact integer accumulation on the hot path and a *
 | TC39 `Decimal` proposal | — | Native decimal128 | — | — | — | Not shipped in browsers. Listed as future work. |
 
 **Decision (ADR-9): a hybrid with layered responsibilities**
-1. **Hot path (worker, per update):** integers only, no library. Prices are `u32` cents, quantities are integers, and notional uses a Float64 integer accumulator with a per-batch BigInt carry. Every generated trade costs one integer multiply-add and creates no objects or GC pressure. At 20k updates/s a decimal library would allocate about 40k objects/s for no gain, because these operations are already exact.
+1. **Hot path (worker, per update):** integers only, no library. Prices are `u32` cents, quantities are integers, and notional uses a Float64 integer accumulator with a per-batch BigInt carry. Every generated trade costs one integer multiply-add and creates no objects or GC pressure. At 20k updates/s a decimal library would allocate about 60k objects/s (three per update) for no gain, because these operations are already exact.
 2. **Transport (worker → main):** the **exact** inputs cross the thread boundary, as integer cents (`number`) plus the notional as `bigint` (structured-cloneable). No quotient is computed or rounded in the worker.
 3. **Presentation (main thread, per snapshot):** `core/money.ts` computes `vwapCents(notional, volume)` with **decimal.js** through a private constructor `Money = Decimal.clone({ precision: 40, rounding: ROUND_HALF_EVEN })`. It keeps full precision as a decimal string. `formatMoney` then rounds **once**, half-even, to whole cents (`toFixed(2, ROUND_HALF_EVEN)`), and `Intl.NumberFormat` formats that decimal string. A JS `number` never holds a fractional money value.
    - *Why one rounding matters:* the earlier draft rounded VWAP to 4 decimals of a cent in the worker and then again for display. That is **double rounding**: an exact 101.505000001 becomes 10150.5000 cents and then, half-even, $101.50 instead of $101.51. A unit test pins this case.
    - *Why precision 40 is enough:* the division's internal rounding to 40 significant digits cannot create a false tie at the 2nd decimal. That would need a run of 0s or 9s longer than `log10(volume)` (≤ 15) digits in a non-terminating `n/d` with `d ≤ 10^15`, and VWAP has ≤ 13 integer digits, so 13 + 2 + 15 < 40.
 4. **Encapsulation:** all `decimal.js` usage sits behind `core/money.ts` (`vwapCents`, `centsToDollars`). Swapping it for Dinero.js or the native TC39 `Decimal` later is a one-file change. decimal.js ships only in the main bundle, and the worker never imports it.
-5. **Evidence:** a micro-benchmark (Phase 6) compares the integer hot path with the same aggregation using `decimal.js` per update at 20k updates/s. The numbers go in the README.
+5. **Evidence:** `npm run bench` (`core/money.bench.ts`, Vitest `bench`) runs `MarketAggregator.ingest` against the same loop with the notional summed in `decimal.js` per update, on a maximum-size batch (1,000 updates over 50 instruments; 20 batches/s is the maximum rate). It also times what the main thread does with `decimal.js` per snapshot: metrics and money formatting for 50 rows. Phase 6 results (Windows desktop, Node 24, three runs, so ranges):
+
+   | Path | Mean per run | Share of one core at 20/s |
+   |---|---|---|
+   | Integer cents + bigint carry, per batch | 0.07 ms | 0.14 % |
+   | `decimal.js` per update, per batch | 0.8–1.0 ms (12–14× slower) | ≈ 2 % |
+   | `decimal.js` per snapshot (VWAP + formatting, 50 rows) | ≈ 0.75 ms | ≈ 1.5 % |
+
+   So both strategies fit the budget at this scale. The integers win on allocation (no objects per update, versus three `Decimal` objects per update) and on simplicity, not because the library would break the rate. *Measurement note:* Vitest's module runner turns every imported binding into a getter. Reading `UpdateField` in the per-update loop through those getters made the integer path look 4–5× slower than it is, so `ingest()` copies the layout constants into locals once per batch. The production bundle is unaffected either way. The numbers go in the README in Phase 7.
 
 **Tests:** the worked example gives a VWAP of `"10150"` cents, displayed as `$101.50`. Half-even ties round to even (`10150.5` → `$101.50`, `10151.5` → `$101.52`). A value just above a tie rounds up, proving there is a single rounding. Notional stays exact beyond 2^53 through the BigInt carry. Volume 0 gives `null`, displayed as `—`.
 
@@ -424,11 +432,16 @@ Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot
 ## 8. Cross-cutting concerns
 
 - **Performance:** the per-update hot path never allocates: the aggregator reads a zero-copy view of Wasm memory (one view object per batch). Snapshots are conflated to at most one in flight and are small (≤ 50 plain objects), so structured cloning is cheap. Rendering is coalesced to rAF and there are no per-update `postMessage` calls. `track row.symbol` keeps DOM nodes stable. Zoneless signals mean only the affected bindings update. At most 50 rows means no virtualization is needed; it is listed as future work for larger universes.
+  - *Measured in Phase 6* (production build, headless Chrome 156, Windows desktop, 50 instruments × 1,000 updates / 50 ms set through the Settings page, 60 s after a 5 s warm-up): about 20,000 updates/s sustained, **no long tasks**, 60 fps, main thread 13–17 % busy (script about 4 %, table layout about 6 %, one layout per committed snapshot, 20/s). Heap after forced GC stayed flat: page 3.5–3.8 MB, worker 0.34–0.37 MB. DOM size was constant (1,356 nodes).
+  - With the page's CPU throttled 4× (DevTools cannot throttle workers, and generation is unaffected), the main thread is 78–92 % busy and occasional frames take 50–77 ms (4–18 per 30 s, at 37–49 fps). The cost is the table's automatic layout plus formatting, about 25 ms per snapshot at that speed. Commits stay coalesced and the totals stay exact; only the frame rate drops. If low-end devices become a target, `table-layout: fixed` with set column widths is the next step.
 - **Precision:** integer cents and an exact BigInt notional. The one division (VWAP) uses `decimal.js` with half-even rounding. Money is formatted from decimal strings. A unit test asserts `$101.50` for the worked example and exactness for large accumulations (§5.6).
 - **Error handling:** typed error codes. `worker.onerror` and `onmessageerror` map to the `error` state. Wasm traps (`RuntimeError`) are caught per tick, the engine stops, and it emits a fatal error.
 - **Security, no inline scripts:** critical-CSS inlining is turned off in the production build (`optimization.styles.inlineCritical: false`). It loads the stylesheet through an inline `onload` handler, which `script-src 'self'` blocks; the page would then keep `media="print"` on the global stylesheet and render unstyled. This was found by the real-browser check in Phase 5. With it off, `index.html` contains only `<script src>` and `<link rel="stylesheet">`, as Angular's security guide recommends for static hosts without per-response nonces. The global CSS is about 2 kB, so inlining gained almost nothing. Component styles are `<style>` elements, which `style-src 'unsafe-inline'` allows.
 - **Security:** Render serves the security headers from `render.yaml`, which is stronger than a `<meta>` CSP because it covers `frame-ancestors` and applies before HTML parsing. The CSP is `default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'`. The other headers are HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and a restrictive `Permissions-Policy`. There are no third-party runtime scripts, and dependency versions are pinned with a lockfile. `npm audit` and `cargo audit` run in CI (non-blocking at first).
+  - *Verified locally* by `npm run check:csp` (Phase 6): it builds, serves `dist/` with `scripts/serve-dist.mjs`, which applies the routes and headers of `render.yaml` itself, and loads `/` and the `/settings` deep link in headless Chrome. It fails on any CSP violation, console error or uncaught exception in the page or the worker, on an inline script or event handler in `index.html`, and when `/`, `/settings` or the worker script is not sent the `render.yaml` policy (a policy that is not sent blocks nothing, so the browser run alone would pass). It passes only once prices appear, which proves that the worker ran and the Wasm compiled under the policy. Negative runs confirmed it catches a missing `'wasm-unsafe-eval'` (worker), a missing style `'unsafe-inline'` (page) and an inline script.
+  - **Caching:** `Cache-Control: no-cache` on everything, overridden by `public, max-age=31536000, immutable` for the content-hashed `*.js`. The planned `/index.html` and `/wasm/*` (`max-age=3600`) rules were replaced in Phase 6. `index.html` is served at every route through the rewrite, so a rule on `/index.html` never matched it. The fixed-name `.wasm` could pair an old module with new JS for an hour after a deploy, and a failed or corrupt response stayed cached, so Retry could not recover (found by the step 37 check). With `no-cache` the browser revalidates instead, which costs one conditional request.
 - **Accessibility:** AXE checks in component tests (`axe-core` run against rendered fixtures), a semantic table, visible focus styles, colour tokens checked against AA by `design-tokens.spec.ts`, which reads `styles.scss` (every text pair ≥ 4.5:1 and every control border and focus ring ≥ 3:1, in both themes), and no motion at all, so nothing needs to be reduced. Status changes are announced politely; the high-frequency numbers are not announced.
+  - *Verified in Phase 6* against the production build: Lighthouse 13.6 accessibility **100** on `/dashboard` and `/settings`. axe-core in real Chrome, with colour contrast measured, found no violations on the dashboard with data, the settings page with a validation error, and the error banner, in both light and dark themes. A keyboard-only walkthrough confirmed the tab order (skip link, nav, Pause, table region, fields, Apply, Reset), a visible 3 px focus ring on every control, the skip link moving focus to the `<h1>` without a reload, Pause/Resume with Enter and Space, focus on the new page's `<h1>` after a nav link, Enter in a field applying the form with its announcement, and focus on the `<h1>` after Retry.
 - **Observability (lightweight):** producer stats panel (rate, gen time, late ticks). `ErrorHandler` via `provideBrowserGlobalErrorListeners`. A `console` logger with levels sits behind a `Logger` service and can later be swapped for Sentry or OpenTelemetry.
 - **Code quality:** TS `strict`, ESLint (`angular-eslint`), Prettier, `cargo fmt` and `cargo clippy -D warnings`. Conventional commits.
 
@@ -450,6 +463,8 @@ Tick → Wasm `generate(n)` → aggregator ingests a zero-copy view → snapshot
 | Settings | Vitest + TestBed | Defaults. Validation (required, non-integer `1.5`, below min, above max, at the boundaries). Editing does not call the store. Apply with valid input calls `startRun` once with the new settings. Apply while invalid is blocked. Apply while paused leads to running. |
 | Components | Vitest + TestBed + axe-core | The table renders unavailable values pre-data, announced as "not available". The Pause/Resume label follows the confirmed state and the button is disabled while starting. The error banner explains each failure and offers Retry only when the producer is down. Settings: every validation message, `aria-invalid`/`aria-describedby`, editing has no effect, Apply starts a new run (also when paused), confirmation, reset to defaults, and form rules ≡ producer rules. No axe violations. Colour contrast is checked by `design-tokens.spec.ts`, because axe cannot measure it under jsdom. |
 | Navigation | Vitest + TestBed with the real `appConfig` | Navigate dashboard → settings → dashboard: the worker factory was called **once** and the paused state is preserved. |
+| Production build in a browser | `npm run check:csp` (headless Chrome over the DevTools protocol, no extra dependency) | The `render.yaml` headers, the SPA rewrite and the CSP: no violations or errors in the page or the worker, data flows, and the deep link renders (§8). |
+| Money benchmark | `npm run bench` (Vitest `bench`, not part of `npm test`) | Integer hot path versus `decimal.js` per update, and the per-snapshot `decimal.js` cost (§5.6). It asserts only that the integer path is faster; absolute timings depend on the machine. |
 
 There are no real-time waits: all timing goes through injected `Scheduler`/`Clock` or `vi.useFakeTimers()`.
 
@@ -461,41 +476,19 @@ There are no real-time waits: all timing goes through injected `Scheduler`/`Cloc
 - `build:wasm` — `cargo build --release --target wasm32-unknown-unknown --manifest-path wasm/market-gen/Cargo.toml`, then `node scripts/copy-wasm.mjs`. The script copies the output to `public/wasm/` and **fails the build if the binary exceeds 50 kB**.
 - `prestart` / `prebuild` / `pretest` → `build:wasm`. Every npm entry point therefore requires Rust. Calling `ng build` directly skips the hook.
 - `test` — `ng test` (Vitest; includes the Wasm contract test). `test:wasm` — `cargo test`.
-- `lint` — `ng lint` (plus the worker type-check from Phase 3). `lint:wasm` — `cargo fmt --check` and `cargo clippy --all-targets -D warnings`.
+- `lint` — `ng lint`, plus `tsc --noEmit` for `tsconfig.worker.json` (Phase 3) and `tsconfig.spec.json` (Phase 6). The Angular builders type-check neither the worker nor files that no spec imports, such as `*.bench.ts`. `lint:wasm` — `cargo fmt --check` and `cargo clippy --all-targets -D warnings`.
+- `bench` — `vitest bench --run` on the `*.bench.ts` files (§5.6). Plain Vitest is enough here, because the benchmark imports only framework-free `core/` code.
+- `serve:dist` — serves the last production build at `http://127.0.0.1:4300` (`PORT` overrides) with the routes and headers of `render.yaml`. Used for manual checks: performance, error paths, Lighthouse.
+- `check:csp` — builds, then runs `scripts/check-csp.mjs` (§8). It needs a local Chrome (`CHROME_PATH` overrides the lookup).
 - `ci` — all lints, then both test suites, then `build`. One command reproduces CI locally.
 
 ### 10.2 Hosting on Render (Static Site)
 
-A **Render Static Site** is free, served from a global CDN and has no cold starts. It is configured as **infrastructure-as-code** with a Blueprint file `render.yaml` at the repo root:
-
-```yaml
-services:
-  - type: web
-    runtime: static
-    name: fintech-dashboard
-    branch: main
-    autoDeployTrigger: checksPass        # deploy only after GitHub CI checks pass on the commit
-    buildCommand: bash scripts/render-build.sh
-    staticPublishPath: dist/Fintech-dashboard/browser   # case-sensitive on Render (Linux); verified with ng build
-    envVars:
-      - key: SKIP_INSTALL_DEPS           # we run `npm ci` ourselves (lockfile-exact, no double install)
-        value: "true"
-    routes:
-      - type: rewrite                    # SPA deep links: /settings → index.html
-        source: /*
-        destination: /index.html
-    headers:
-      - path: /*
-        name: Content-Security-Policy
-        value: "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-      - { path: /*, name: Strict-Transport-Security, value: "max-age=63072000; includeSubDomains" }
-      - { path: /*, name: X-Content-Type-Options, value: nosniff }
-      - { path: /*, name: Referrer-Policy, value: no-referrer }
-      - { path: /*, name: Permissions-Policy, value: "camera=(), microphone=(), geolocation=()" }
-      - { path: /*.js, name: Cache-Control, value: "public, max-age=31536000, immutable" }   # hashed bundles
-      - { path: /index.html, name: Cache-Control, value: no-cache }
-      - { path: /wasm/*, name: Cache-Control, value: "public, max-age=3600" }
-```
+A **Render Static Site** is free, served from a global CDN and has no cold starts. It is configured as **infrastructure-as-code** with a Blueprint file, `render.yaml`, at the repo root. It was written in Phase 6, so the local checks run against it, and it is the single source of truth: `scripts/serve-dist.mjs` reads its routes and headers.
+- **Service:** `type: web`, `runtime: static`, `branch: main`, `autoDeployTrigger: checksPass` (deploy only after the GitHub checks pass), `buildCommand: bash scripts/render-build.sh` (the script arrives in Phase 7), `staticPublishPath: dist/Fintech-dashboard/browser` (case-sensitive on Render's Linux), `SKIP_INSTALL_DEPS=true` (the build script runs `npm ci` itself).
+- **Routes:** a rewrite `/*` → `/index.html` for SPA deep links. Render applies rules only where no file exists, so real files are served as-is.
+- **Headers** (matched on the request path): on `/*`, the CSP from §8, HSTS (`max-age=63072000; includeSubDomains`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: camera=(), microphone=(), geolocation=()` and `Cache-Control: no-cache`. On `/*.js`, `Cache-Control: public, max-age=31536000, immutable`.
+- **Changed from the plan in Phase 6:** the CSP has no `img-src 'self' data:`, because the app loads no `data:` images and `default-src 'self'` covers its own. §8 already listed the policy without it. The cache rules changed as well (§8, Caching). Render does not document what happens when two rules set the same header on one path. `serve-dist` applies the last match, and Phase 7 checks the live headers (step 44). If Render combined the two values, bundles would only be revalidated, never served stale.
 
 **Deployment readiness: is a server (Express or similar) needed?** Verified on 2026-10-29, the answer is **no**.
 
@@ -528,7 +521,7 @@ A minimal rustup install adds about 30–60 s per build. The `.wasm` compile add
 
 **Notes:**
 - `base href` is `/`, so no sub-path tricks are needed. The `routes` rewrite handles deep links natively, so no `404.html` hack is needed.
-- The `.wasm` file name is stable because it lives in `public/`, so it gets a short `max-age`. Content-hashing it is a possible improvement (§16).
+- The `.wasm` file name is stable because it lives in `public/`, so it is revalidated on every load (`no-cache`) rather than cached for a fixed time (§8). Content-hashing it would allow `immutable` caching (§16).
 - Because Render serves custom headers, `COOP`/`COEP` can be enabled later for `SharedArrayBuffer` (§16).
 
 ### 10.3 GitHub Actions CI (`.github/workflows/ci.yml`)
@@ -575,13 +568,14 @@ Fintech-dashboard/
 ├─ wasm/market-gen/
 │  ├─ Cargo.toml
 │  └─ src/{lib.rs, rng.rs, model.rs, generator.rs}   (+ #[cfg(test)] modules)
-├─ scripts/{copy-wasm.mjs, render-build.sh}
+├─ scripts/{copy-wasm.mjs, serve-dist.mjs, check-csp.mjs, render-build.sh}
 ├─ public/wasm/            (build output, git-ignored)
 ├─ src/app/
 │  ├─ core/                (framework-free, shared by worker + UI)
 │  │  ├─ settings.ts       defaults, limits, validateSettings()
 │  │  ├─ protocol.ts       commands/events, type guards
 │  │  ├─ money.ts          decimal.js wrapper: vwapCents(), centsToDollars()
+│  │  ├─ money.bench.ts    integer vs decimal.js benchmark (npm run bench)
 │  │  ├─ market-update.ts  Wasm update record layout (stride, field offsets, ABI version)
 │  │  ├─ metrics.ts        spread(), vwap(), imbalance()
 │  │  ├─ aggregator.ts     MarketAggregator
@@ -691,17 +685,18 @@ Each step ends with a verifiable check and a commit, which keeps the development
 35. **Commit** `feat(ui): dashboard and settings pages`.
 
 ### Phase 6 — Hardening (½ day)
-36. Manual perf check at 50 instruments × 1000 per 50 ms: Chrome Performance panel, no long tasks from the data path, stable memory.
-37. Error paths: rename the wasm file locally to get the fetch error, corrupt the bytes to get the compile error. Both should show the banner, and Retry should recover.
-38. Verify the CSP locally: serve `dist/` with the same headers as `render.yaml` (e.g. a tiny static server script) and confirm that Wasm (`'wasm-unsafe-eval'`) and the worker (`worker-src 'self'`) load with no console violations.
-39. Lighthouse accessibility check (target 100) and a keyboard-only walkthrough.
+36. Manual perf check at 50 instruments × 1000 per 50 ms: Chrome Performance panel, no long tasks from the data path, stable memory. → *done:* no long tasks, 60 fps and flat memory at 20k updates/s; the 4× CPU slowdown result is in §8.
+36a. Money benchmark (moved here from step 12a): `npm run bench`. → *done:* results in §5.6.
+37. Error paths: rename the wasm file locally to get the fetch error, corrupt the bytes to get the compile error. Both should show the banner, and Retry should recover. → *found and fixed:* behind the SPA rewrite a missing file was reported as a compile error (now `WASM_FETCH_FAILED`, §5.2), and the `/wasm/*` `max-age` kept the broken response cached, so Retry could not recover (now `no-cache`, §8).
+38. Verify the CSP locally: serve `dist/` with the same headers as `render.yaml` (e.g. a tiny static server script) and confirm that Wasm (`'wasm-unsafe-eval'`) and the worker (`worker-src 'self'`) load with no console violations. → *done:* `render.yaml` written early, `npm run serve:dist` and `npm run check:csp` (§8, §10.1).
+39. Lighthouse accessibility check (target 100) and a keyboard-only walkthrough. → *done:* 100 on both pages; axe with contrast in both themes; walkthrough results in §8. No fixes were needed.
 40. **Commit** `chore: hardening, csp, a11y fixes`.
 
 ### Phase 7 — CI/CD on GitHub and hosting on Render (½–1 day), following the pipeline roadmap in §10.4
 41. Extend `ci.yml` to the full `wasm` → `web` (+ `audit`) pipeline from §10.3, with the wasm artifact handed between jobs and a size check. → *verify:* green checks on push.
-42. **Render spike:** write `scripts/render-build.sh` (with rustup detection and install) and `render.yaml` (Static Site, `staticPublishPath: dist/Fintech-dashboard/browser`, `SKIP_INSTALL_DEPS`, SPA rewrite, headers). In Render: **New → Blueprint** → select the repo. Do not use "Web Service": no server is needed (§10.2). → *verify:* the first deploy succeeds and the build log shows the Rust target installed. If it fails or is too slow, switch to §10.5 Option A or B.
+42. **Render spike:** write `scripts/render-build.sh` (with rustup detection and install). `render.yaml` already exists (Phase 6, step 38). In Render: **New → Blueprint** → select the repo. Do not use "Web Service": no server is needed (§10.2). → *verify:* the first deploy succeeds and the build log shows the Rust target installed. If it fails or is too slow, switch to §10.5 Option A or B.
 43. Set `autoDeployTrigger: checksPass` and confirm Render waits for the GitHub checks. → *verify:* a commit with a failing test is **not** deployed, and a green one is.
-44. Check the headers on the live site (`curl -I`, securityheaders.com) and the deep link `/settings` (rewrite). → *verify:* CSP, HSTS and nosniff are present, and the deep link loads the app.
+44. Check the headers on the live site (`curl -I`, securityheaders.com) and the deep link `/settings` (rewrite). → *verify:* CSP, HSTS and nosniff are present, and the deep link loads the app. `Cache-Control` is `no-cache` on `/`, `/settings` and `/wasm/market_gen.wasm`, and `public, max-age=31536000, immutable` on a `main-*.js` bundle. That confirms how Render resolves the two overlapping `Cache-Control` rules (§10.2).
 45. Show build metadata (commit SHA from `RENDER_GIT_COMMIT`, build time) in the footer. → *verify:* it matches `git rev-parse --short HEAD`.
 46. Turn on branch protection for `main` with the required checks `wasm` and `web`.
 47. Write the README: overview, live demo link, CI badge, architecture summary, prerequisites (Node 24, Rust stable + wasm target), `npm ci`, `npm start`, `npm test`, `npm run test:wasm`, `npm run ci`, how deploys work (Render + checks) and a link to this spec.
@@ -732,9 +727,11 @@ Each step ends with a verifiable check and a commit, which keeps the development
 | Old run results rejected | FR-S3, ADR-5 | runId fencing | market.store.spec, producer-engine.spec |
 | Wasm generates updates with state, evolution and invariants | FR-P1–P5 | `wasm/market-gen` | cargo tests, wasm contract test |
 | Worker hosts Wasm | FR-P6 | `market.worker.ts` | engine spec, manual |
-| Init errors and cleanup | FR-P7/8 | adapter error mapping, `DestroyRef`, retry | client spec, engine spec |
-| UI usable at high rate | NFR-1 | conflation, rAF, zero-copy | engine spec, manual perf |
-| Integer cents, rounding only for display | NFR-2, ADR-9 | Integer hot path, `core/money.ts` (decimal.js, half-even) | money.spec, aggregator.spec |
+| Init errors and cleanup | FR-P7/8 | adapter error mapping, `DestroyRef`, retry | client spec, engine spec, wasm-market-generator.spec, Phase 6 error-path check |
+| UI usable at high rate | NFR-1 | conflation, rAF, zero-copy | engine spec, Phase 6 perf check (§8) |
+| Integer cents, rounding only for display | NFR-2, ADR-9 | Integer hot path, `core/money.ts` (decimal.js, half-even) | money.spec, aggregator.spec, money.bench |
+| Hardened static hosting (CSP, security headers) | NFR-6 | `render.yaml`, no inline scripts | `npm run check:csp` |
+| Accessible UI (WCAG 2.2 AA, AXE) | NFR-4 | Semantic markup, focus management, design tokens | component axe specs, design-tokens.spec, Phase 6 Lighthouse and keyboard check (§8) |
 | Auto deploy on every push | NFR-9, §10.4 | GitHub Actions CI + Render `checksPass` | pipeline run, R4/R8 rehearsal |
 
 ---
@@ -746,13 +743,18 @@ Each step ends with a verifiable check and a commit, which keeps the development
 | Rust toolchain not installed locally or in CI | Build blocked | Phase 0 install. CI uses `dtolnay/rust-toolchain`. README prerequisites. |
 | Rust unavailable or slow in Render's build image | Deploy blocked or slow | `render-build.sh` installs a minimal toolchain. Early spike (step 42). Fallbacks in §10.5. |
 | Render free tier limits (build minutes, bandwidth) | Deploy delays | A static site has no spin-down. Keep builds lean (minimal rustup profile, npm cache). Monitor usage. |
-| Decimal library cost on the hot path | Jank at high rate | Library used only per snapshot (§5.6). The benchmark proves the budget. |
+| Decimal library cost on the hot path | Jank at high rate | Library used only per snapshot (§5.6). The Phase 6 benchmark puts it at ≈ 0.75 ms per snapshot, about 1.5 % of the main thread at 20 snapshots/s. |
 | Angular worker bundling of shared `core/` code | Build errors | Keep `core/` free of Angular imports. Use a dedicated `tsconfig.worker.json`. |
 | Worker code is not type-checked by the Angular application builder | Type errors reach runtime | An explicit `tsc --noEmit -p tsconfig.worker.json` in `lint`, which CI runs. Engine logic lives in modules that specs also import, so they are type-checked by the test build too. |
 | SPA deep links 404 on the host | Broken refresh on `/settings` | Render `routes` rewrite `/* → /index.html`. The wasm URL is resolved against `document.baseURI`. |
 | Signal Forms API differences between minor versions | Rework | Pin the Angular version. Verify the API against the current docs before implementation (done in Phase 5: `[formField]`, `FormRoot`, `submission`). |
 | Signal Forms loses all but the first of several sibling-field edits made in one synchronous task | Scripted fills drop values | Not reachable with keyboard or pointer input. Automation yields between fields (§5.5). |
-| Critical-CSS inlining adds an inline `onload` script that the CSP blocks | Unstyled page in production | Turned off in the production build (§8). Verified in headless Chrome against the production build with the planned CSP (no violations, no inline script in `index.html`); that check moves into the repo in Phase 6 (step 38). |
+| Critical-CSS inlining adds an inline `onload` script that the CSP blocks | Unstyled page in production | Turned off in the production build (§8). Verified in headless Chrome against the production build with the planned CSP (no violations, no inline script in `index.html`). Since Phase 6 the check is in the repo: `npm run check:csp`. |
+| The SPA rewrite answers a missing `.wasm` with `index.html` and HTTP 200 | A missing file looks like a corrupt one | The adapter treats an HTML response as `WASM_FETCH_FAILED` (§5.2). Found in Phase 6. |
+| A fixed-name asset or a failed response stays in the browser cache | Stale Wasm paired with new JS after a deploy; Retry cannot recover | `Cache-Control: no-cache` on everything except the content-hashed JS bundles (§8). Found in Phase 6. |
+| Overlapping `Cache-Control` rules (`/*` and `/*.js`) resolve differently on Render than locally | Bundles only revalidated, or an unexpected header | Not documented by Render. `serve-dist` applies the last match. Checked on the live site in Phase 7 (step 44); every possible outcome still serves fresh HTML and Wasm. |
+| An old tab lazy-loads a chunk that a deploy removed | The rewrite answers `/chunk-OLD.js` with `index.html`, which the `/*.js` rule caches as `immutable` for a year. If a later revert brings back the same file name (hashes are deterministic), that browser keeps the cached HTML and the route stays broken | Accepted: it needs an old tab, the removed chunk and then a revert to that exact build. The alternative is to rewrite only the known routes (`/dashboard`, `/settings`), at the cost of a host 404 instead of the router's `**` redirect for unknown paths. Revisit if rollbacks become routine. Found by the Phase 6 review. |
+| Benchmarks under Vitest measure the module runner instead of the code | Wrong numbers in the spec and README | Vitest warns about export getters in hot loops. `MarketAggregator.ingest` reads the layout through locals (§5.6). |
 | A detached Wasm memory view after growth | Silent corruption or crash | Pre-allocate at `init`. Re-create the view when `memory.buffer` identity changes. Cover this with a test. |
 | Floating-point drift in VWAP | Wrong numbers | Exact integer/BigInt notional. Divide only at snapshot time. |
 

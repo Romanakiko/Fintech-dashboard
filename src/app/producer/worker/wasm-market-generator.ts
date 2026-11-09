@@ -36,6 +36,13 @@ export async function loadWasmMarketGenerator(
   if (!response.ok) {
     throw new ProducerError('WASM_FETCH_FAILED', `Could not fetch ${url}: HTTP ${response.status}`);
   }
+  // A static host's SPA rewrite answers a missing file with index.html and HTTP 200.
+  if (response.headers.get('Content-Type')?.startsWith('text/html')) {
+    throw new ProducerError(
+      'WASM_FETCH_FAILED',
+      `Could not fetch ${url}: the server sent an HTML page, so the file is probably missing`,
+    );
+  }
   let instance: WebAssembly.Instance;
   try {
     instance = await instantiate(response);

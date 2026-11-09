@@ -47,21 +47,25 @@ export class MarketAggregator {
 
   /** Applies `count` updates laid out as UPDATE_STRIDE u32 values each. */
   ingest(updates: Uint32Array, count: number): void {
-    if (updates.length < count * UPDATE_STRIDE) {
-      throw new RangeError(`Expected ${count} updates, got ${updates.length / UPDATE_STRIDE}`);
+    // Locals rather than imports in the per-update loop: module runners that wrap imports in
+    // getters (Vitest's, used by `npm run bench`) would otherwise dominate what is measured.
+    const stride = UPDATE_STRIDE;
+    const field = UpdateField;
+    if (updates.length < count * stride) {
+      throw new RangeError(`Expected ${count} updates, got ${updates.length / stride}`);
     }
-    for (let offset = 0; offset < count * UPDATE_STRIDE; offset += UPDATE_STRIDE) {
-      const i = updates[offset + UpdateField.instrument];
+    for (let offset = 0; offset < count * stride; offset += stride) {
+      const i = updates[offset + field.instrument];
       if (i >= this.instrumentCount) {
         throw new RangeError(`Instrument ${i} is outside 0..${this.instrumentCount - 1}`);
       }
-      const price = updates[offset + UpdateField.priceCents];
-      const qty = updates[offset + UpdateField.tradeQty];
+      const price = updates[offset + field.priceCents];
+      const qty = updates[offset + field.tradeQty];
       this.lastPrice[i] = price;
-      this.bid[i] = updates[offset + UpdateField.bidCents];
-      this.ask[i] = updates[offset + UpdateField.askCents];
-      this.bidQty[i] = updates[offset + UpdateField.bidQty];
-      this.askQty[i] = updates[offset + UpdateField.askQty];
+      this.bid[i] = updates[offset + field.bidCents];
+      this.ask[i] = updates[offset + field.askCents];
+      this.bidQty[i] = updates[offset + field.bidQty];
+      this.askQty[i] = updates[offset + field.askQty];
       this.volume[i] += qty;
       this.batchNotional[i] += price * qty;
     }

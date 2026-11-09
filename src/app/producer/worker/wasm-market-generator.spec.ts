@@ -40,7 +40,7 @@ describe('loadWasmMarketGenerator', () => {
     }
   });
 
-  it('falls back to buffered compilation for any other MIME type', async () => {
+  it('falls back to buffered compilation for another binary MIME type', async () => {
     const streaming = vi.spyOn(WebAssembly, 'instantiateStreaming');
     const generator = await loadWasmMarketGenerator(
       WASM_URL,
@@ -81,13 +81,27 @@ describe('loadWasmMarketGenerator', () => {
       });
     });
 
-    it('maps bytes that are not Wasm to WASM_COMPILE_FAILED', async () => {
-      const html = serve('<!doctype html>', { headers: { 'Content-Type': 'text/html' } });
+    it('maps an HTML page in place of the module (SPA fallback) to WASM_FETCH_FAILED', async () => {
+      const html = serve('<!doctype html>', {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' },
+      });
 
       await expect(loadWasmMarketGenerator(WASM_URL, html)).rejects.toMatchObject({
-        code: 'WASM_COMPILE_FAILED',
+        code: 'WASM_FETCH_FAILED',
+        message: expect.stringContaining('probably missing'),
       });
     });
+
+    it.each(['application/wasm', 'application/octet-stream'])(
+      'maps bytes that are not Wasm (%s) to WASM_COMPILE_FAILED',
+      async (contentType) => {
+        const corrupt = serve('not wasm', { headers: { 'Content-Type': contentType } });
+
+        await expect(loadWasmMarketGenerator(WASM_URL, corrupt)).rejects.toMatchObject({
+          code: 'WASM_COMPILE_FAILED',
+        });
+      },
+    );
 
     it('maps a module without the expected exports to ABI_MISMATCH', async () => {
       const empty = serve(EMPTY_MODULE, { headers: { 'Content-Type': 'application/wasm' } });
