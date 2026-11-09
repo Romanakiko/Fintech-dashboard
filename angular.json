@@ -31,7 +31,11 @@
                 "input": "public"
               }
             ],
-            "styles": ["src/styles.scss"]
+            "styles": ["src/styles.scss"],
+            "define": {
+              "BUILD_COMMIT": "''",
+              "BUILD_TIME": "''"
+            }
           },
           "configurations": {
             "production": {

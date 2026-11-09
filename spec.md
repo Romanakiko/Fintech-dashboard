@@ -304,6 +304,7 @@ There is deliberately no separate `SettingsStore`. The applied settings are the 
 | `MarketTable` | `<table>` with `<caption>`, `<th scope="col">`, row headers `<th scope="row">`, `@for (row of cells(); track row.symbol)` | A presentational component (`rows` input); formatting and money rounding happen only here, in a `computed`. Numeric cells right-aligned with tabular numbers. "Unavailable" renders as a visible `—` (`aria-hidden`) plus visually hidden "not available", because screen readers skip or misread a bare dash. A focusable, labelled scroll region keeps the table usable on narrow screens. The optional tick flash was left out: at high rates it is noise, and the task does not ask for it. |
 | `SettingsPage` (lazy) | Signal Forms form with three integer fields, Apply and "Reset to defaults" | See §5.5. Errors appear as soon as a field is edited (dirty) or left (touched), so a disabled Apply always has a visible reason. Each error is linked with `aria-describedby` together with the field hint, and the input gets `aria-invalid`. After Apply, a `role="status"` confirmation is shown until the next edit. |
 | `ErrorBanner` (`layout/error-banner.ts`) | A plain-language headline per error code, the technical message and code, and **Retry** for fatal errors only | `role="alert"`. Placed at the top of `<main>`, so it is visible on every page. Retry calls `MarketStore.connect()`. |
+| `BuildInfoLine` (`layout/build-info.ts`) | The commit (7 characters, like `git rev-parse --short`) and the UTC build time, in the page `<footer>` (the `contentinfo` landmark) | Added in Phase 7 (§10.4, R5). The values are build-time constants (`BUILD_COMMIT`, `BUILD_TIME`, §10.2) read through a `BUILD_INFO` token, so a test can provide a deployed build's values. Without them, the footer says "Local build". |
 
 **Formatting** (`core/format.ts`, pure, tested): `formatMoney(minorUnits: number | string | null)`, `formatSpread`, `formatImbalance(v)` → `+0.20` / `−0.35` / `0.00`, `formatVolume` (grouping). Each one returns `'—'` for unavailable values. Money is converted from cents to a decimal string with `decimal.js` (`.div(100).toFixed(2, ROUND_HALF_EVEN)`). The string goes to `Intl.NumberFormat.format()`, which formats decimal strings exactly (Intl.NumberFormat v3). `Intl.NumberFormat` instances are cached.
 
@@ -485,7 +486,7 @@ There are no real-time waits: all timing goes through injected `Scheduler`/`Cloc
 ### 10.2 Hosting on Render (Static Site)
 
 A **Render Static Site** is free, served from a global CDN and has no cold starts. It is configured as **infrastructure-as-code** with a Blueprint file, `render.yaml`, at the repo root. It was written in Phase 6, so the local checks run against it, and it is the single source of truth: `scripts/serve-dist.mjs` reads its routes and headers.
-- **Service:** `type: web`, `runtime: static`, `branch: main`, `autoDeployTrigger: checksPass` (deploy only after the GitHub checks pass), `buildCommand: bash scripts/render-build.sh` (the script arrives in Phase 7), `staticPublishPath: dist/Fintech-dashboard/browser` (case-sensitive on Render's Linux), `SKIP_INSTALL_DEPS=true` (the build script runs `npm ci` itself).
+- **Service:** `type: web`, `runtime: static`, `branch: main`, `autoDeployTrigger: checksPass` (deploy only after the GitHub checks pass), `buildCommand: bash scripts/render-build.sh` (written in Phase 7), `staticPublishPath: dist/Fintech-dashboard/browser` (case-sensitive on Render's Linux), `SKIP_INSTALL_DEPS=true` (the build script runs `npm ci` itself).
 - **Routes:** a rewrite `/*` → `/index.html` for SPA deep links. Render applies rules only where no file exists, so real files are served as-is.
 - **Headers** (matched on the request path): on `/*`, the CSP from §8, HSTS (`max-age=63072000; includeSubDomains`), `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy: camera=(), microphone=(), geolocation=()` and `Cache-Control: no-cache`. On `/*.js`, `Cache-Control: public, max-age=31536000, immutable`.
 - **Changed from the plan in Phase 6:** the CSP has no `img-src 'self' data:`, because the app loads no `data:` images and `default-src 'self'` covers its own. §8 already listed the policy without it. The cache rules changed as well (§8, Caching). Render does not document what happens when two rules set the same header on one path. `serve-dist` applies the last match, and Phase 7 checks the live headers (step 44). If Render combined the two values, bundles would only be revalidated, never served stale.
@@ -504,20 +505,21 @@ A **Render Static Site** is free, served from a global CDN and has no cold start
 | Blueprint usage | `render.yaml` only applies when the service is created through **New → Blueprint** | Create it that way. The GitHub account is already connected to Render. The service name is auto-generated from `name:`, which is fine. |
 | Bundle budget | Current initial bundle is 217 kB raw / 60 kB transfer, below the 500 kB warning | No action. Keep it in mind when adding libraries (`decimal.js` adds ~12 kB gzipped, and is loaded in the worker and the main-thread formatter). |
 
-**`scripts/render-build.sh` (planned):**
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-if ! command -v rustup >/dev/null 2>&1; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
-fi
-source "$HOME/.cargo/env"
-rustup target add wasm32-unknown-unknown
-npm ci
-npm run build:wasm
-npx ng build --configuration production
-```
-A minimal rustup install adds about 30–60 s per build. The `.wasm` compile adds a few seconds. **This is verified in the Phase 7 spike.** If it proves unreliable, the fallbacks are in §10.5.
+**[`scripts/render-build.sh`](scripts/render-build.sh) (Phase 7)** does the following, in order, under `set -euo pipefail`:
+1. It sources `${CARGO_HOME:-~/.cargo}/env` if the file exists. If `rustup` is still missing, it installs it from `sh.rustup.rs` (`--profile minimal --default-toolchain stable --no-modify-path`) and sources the file.
+2. `rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown --no-self-update`, then `rustc --version` for the build log.
+3. `npm ci`, then `npm run build:wasm`, which also applies the 50 kB budget.
+4. `ng build --configuration production` with `--define "BUILD_COMMIT='…'"` (from `RENDER_GIT_COMMIT`, or `git rev-parse HEAD` outside Render) and `--define "BUILD_TIME='…'"` (UTC, ISO 8601).
+
+Changes from the plan, which was a 10-line sketch:
+- **Reuse.** It sources the env file **before** looking for `rustup`, so a toolchain left by an earlier build is reused if Render keeps the home directory. The planned check alone would always reinstall, because a new build shell does not have `~/.cargo/bin` on its `PATH`.
+- **No profile edits.** `--no-modify-path` leaves shell profiles alone, since the script sources the file itself.
+- **Toolchain updates.** `rustup toolchain install` replaces `rustup target add`. It is safe to repeat, and it also updates a reused toolchain to the current stable, as CI uses. It installs only the parts that are missing.
+- **No rustup self-update.** `--no-self-update` keeps a rustup update, which the build does not need, out of the build.
+- **Build metadata.** The commit and build time go to `ng build --define` (§10.4, R5). `angular.json` defines both as `''`, and the CLI merges command-line values over those defaults. Every other build therefore compiles unchanged, and its footer says "Local build".
+- **No `npx`.** It runs `./node_modules/.bin/ng` directly, so the `--define` quoting passes through one shell only.
+
+*Verified locally in Phase 7:* the script ran end to end in a fresh copy of the repository with `RENDER_GIT_COMMIT` set. The toolchain was present, so the install branch was skipped. The build passed `check-csp.mjs`'s browser run, and headless Chrome showed the footer "Commit c0ffee0, built 2026-11-09 15:40 UTC". rustup reported the toolchain "unchanged" and did not update itself. Locally the `.wasm` compile took about 4 s. On Render, a minimal rustup install should add about 30–60 s per build. **The install branch and the timing on Render are verified by the first deploy (step 42).** If it proves unreliable, the fallbacks are in §10.5.
 
 **Notes:**
 - `base href` is `/`, so no sub-path tricks are needed. The `routes` rewrite handles deep links natively, so no `404.html` hack is needed.
@@ -532,7 +534,7 @@ Trigger: `push` to any branch and `pull_request` to `main`. Concurrency: `ci-${{
 |---|---|---|
 | `wasm` | checkout → `dtolnay/rust-toolchain@stable` (target `wasm32-unknown-unknown`, components `rustfmt, clippy`) → `Swatinem/rust-cache` → `cargo fmt --check` → `cargo clippy --all-targets -D warnings` → `cargo test` | Rust quality gate. |
 | `web` (parallel) | checkout → Rust toolchain + cache → `actions/setup-node` (`node-version-file: .node-version`, `cache: npm`) → `npm ci` → `npm run lint` → `npm test` (the `pretest` hook builds the `.wasm` and checks its size; includes the contract test) → `npm run build` | Angular quality gate and production build, including budgets. It builds Wasm exactly the way Render does, so no artifact hand-off between jobs is needed. That is simpler, and the build path stays identical to production. |
-| `audit` (non-blocking) | `npm audit --audit-level=high`, `cargo audit` | Supply-chain visibility. |
+| `audit` (non-blocking) | checkout → `actions/setup-node` (automatic npm cache off) → `npm audit --audit-level=high` (reads the lockfile, no install) → `cargo audit` (prebuilt binary from `taiki-e/install-action`) → a warning annotation on the run if either audit step failed, because of findings or because it could not run | Supply-chain visibility. The two audit steps and the cargo-audit download have `continue-on-error`. Audit findings and a failed download therefore leave the check green, and never block a deploy: Render deploys only if every check on the commit passes (`success`, `neutral` or `skipped`). A job-level `continue-on-error` would keep only the workflow green, while the job's own check would still fail. The npm cache is off because the job installs nothing. `setup-node` turns caching on whenever `package.json` has a `packageManager` field, and would save a near-empty `~/.npm` under the key that `web` uses. |
 
 Branch protection on `main`: require the `wasm` and `web` checks, require a PR for changes (direct pushes allowed for the owner during the interview) and use linear history. Because Render's `autoDeployTrigger` is `checksPass`, **a red pipeline never reaches production**.
 
@@ -541,7 +543,7 @@ Branch protection on `main`: require the `wasm` and `web` checks, require a PR f
 | Step | Deliverable | Satisfies | Verify |
 |---|---|---|---|
 | R1 | Repository `Romanakiko/Fintech-dashboard`, branch `main`, incremental conventional commits per phase (§13) | 5.1 "keep the development commit history" | `git log` shows phase commits |
-| R2 | `ci.yml` with the `wasm` and `web` jobs | 5.1 tests runnable, 5.2 build automation | A PR shows two green checks |
+| R2 | `ci.yml` with the `wasm` and `web` jobs, plus the non-blocking `audit` (Phase 7) | 5.1 tests runnable, 5.2 build automation | A PR shows three green checks, and Render waits for all of them |
 | R3 | `render.yaml` Blueprint plus `scripts/render-build.sh`. Render dashboard: **New → Blueprint** → connect the GitHub repo | 5.2 hosting connected to the repository | The first deploy is live at `https://fintech-dashboard.onrender.com` (or similar) |
 | R4 | `autoDeployTrigger: checksPass` confirmed | 5.2 "each push … automatically build and redeploy" with no manual steps | Push a visible change (e.g. a footer version label) and it appears live without touching Render |
 | R5 | Build metadata: inject the commit SHA and build time into the footer (`RENDER_GIT_COMMIT` env var at build) | Makes "is the live demo up to date?" checkable during the interview | The footer SHA matches `git rev-parse --short HEAD` |
@@ -589,7 +591,7 @@ Fintech-dashboard/
 │  ├─ features/
 │  │  ├─ dashboard/{dashboard.page.ts, market-table.ts, producer-controls.ts}
 │  │  └─ settings/{settings.page.ts}
-│  ├─ layout/{producer-status.ts, error-banner.ts}
+│  ├─ layout/{producer-status.ts, error-banner.ts, build-info.ts}
 │  ├─ app.ts, app.routes.ts, app.config.ts
 ├─ tsconfig.worker.json
 ├─ spec.md, README.md
@@ -693,15 +695,17 @@ Each step ends with a verifiable check and a commit, which keeps the development
 40. **Commit** `chore: hardening, csp, a11y fixes`.
 
 ### Phase 7 — CI/CD on GitHub and hosting on Render (½–1 day), following the pipeline roadmap in §10.4
-41. Extend `ci.yml` to the full `wasm` → `web` (+ `audit`) pipeline from §10.3, with the wasm artifact handed between jobs and a size check. → *verify:* green checks on push.
-42. **Render spike:** write `scripts/render-build.sh` (with rustup detection and install). `render.yaml` already exists (Phase 6, step 38). In Render: **New → Blueprint** → select the repo. Do not use "Web Service": no server is needed (§10.2). → *verify:* the first deploy succeeds and the build log shows the Rust target installed. If it fails or is too slow, switch to §10.5 Option A or B.
+41. Extend `ci.yml` to the full `wasm` → `web` (+ `audit`) pipeline from §10.3, with the wasm artifact handed between jobs and a size check. → *verify:* green checks on push. → *done in the repository; the green checks are verified on the first push:* `wasm` and `web` were already in place, so Phase 7 added the non-blocking `audit` job (§10.3). **Changed from this step:** the artifact is not handed between jobs. As §10.3 explains, `web` compiles the Wasm through the npm hooks, exactly as Render does. `copy-wasm.mjs` runs the 50 kB size check in both.
+42. **Render spike:** write `scripts/render-build.sh` (with rustup detection and install). `render.yaml` already exists (Phase 6, step 38). In Render: **New → Blueprint** → select the repo. Do not use "Web Service": no server is needed (§10.2). → *verify:* the first deploy succeeds and the build log shows the Rust target installed. If it fails or is too slow, switch to §10.5 Option A or B. → *script done and run locally* (§10.2). The Blueprint and the first deploy are pending.
 43. Set `autoDeployTrigger: checksPass` and confirm Render waits for the GitHub checks. → *verify:* a commit with a failing test is **not** deployed, and a green one is.
 44. Check the headers on the live site (`curl -I`, securityheaders.com) and the deep link `/settings` (rewrite). → *verify:* CSP, HSTS and nosniff are present, and the deep link loads the app. `Cache-Control` is `no-cache` on `/`, `/settings` and `/wasm/market_gen.wasm`, and `public, max-age=31536000, immutable` on a `main-*.js` bundle. That confirms how Render resolves the two overlapping `Cache-Control` rules (§10.2).
-45. Show build metadata (commit SHA from `RENDER_GIT_COMMIT`, build time) in the footer. → *verify:* it matches `git rev-parse --short HEAD`.
+45. Show build metadata (commit SHA from `RENDER_GIT_COMMIT`, build time) in the footer. → *verify:* it matches `git rev-parse --short HEAD`. → *done:* `render-build.sh` passes both values with `ng build --define`, and `angular.json` defines empty defaults, so development, test and CI builds compile unchanged (the CLI merges the two). `BuildInfoLine` renders them (§5.4).
 46. Turn on branch protection for `main` with the required checks `wasm` and `web`.
-47. Write the README: overview, live demo link, CI badge, architecture summary, prerequisites (Node 24, Rust stable + wasm target), `npm ci`, `npm start`, `npm test`, `npm run test:wasm`, `npm run ci`, how deploys work (Render + checks) and a link to this spec.
+47. Write the README: overview, live demo link, CI badge, architecture summary, prerequisites (Node 24, Rust stable + wasm target), `npm ci`, `npm start`, `npm test`, `npm run test:wasm`, `npm run ci`, how deploys work (Render + checks) and a link to this spec. → *done*, with the Phase 6 performance and benchmark results (§5.6, §8).
 48. Make a visible change, push it and confirm that it goes live with no manual action. → *verify:* timed end to end.
 49. **Commits** `ci: full pipeline`, `chore(deploy): render blueprint`, `docs: README`.
+
+*Status at the Phase 7 hand-off:* steps 41, 45 and 47 are done in the repository, and step 42's script is written and was run locally. The rest need the Render and GitHub accounts, so the owner does them: the Blueprint and first deploy (42), the gated-deploy check (43), the live headers (44), branch protection (46) and the timed rehearsal (48).
 
 ### Phase 8 — Interview readiness
 50. Prepare a 5-minute architecture walkthrough using §4, §5.6, §12 and the trade-offs.

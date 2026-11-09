@@ -2,13 +2,21 @@ import { Component, DOCUMENT, Injector, afterNextRender, inject } from '@angular
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { NavigationEnd, Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/router';
 import { filter } from 'rxjs';
+import { BuildInfoLine } from './layout/build-info';
 import { ErrorBanner } from './layout/error-banner';
 import { focusMainHeading } from './layout/focus-main';
 import { ProducerStatusBadge } from './layout/producer-status';
 
 @Component({
   selector: 'app-root',
-  imports: [RouterOutlet, RouterLink, RouterLinkActive, ErrorBanner, ProducerStatusBadge],
+  imports: [
+    RouterOutlet,
+    RouterLink,
+    RouterLinkActive,
+    BuildInfoLine,
+    ErrorBanner,
+    ProducerStatusBadge,
+  ],
   templateUrl: './app.html',
   styleUrl: './app.scss',
 })

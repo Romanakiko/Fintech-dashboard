@@ -61,3 +61,44 @@ jobs:
       - run: npm run lint
       - run: npm test -- --watch=false
       - run: npm run build
+
+  # Supply-chain visibility, non-blocking (spec §10.3). The audit steps, and the download
+  # of cargo-audit, may fail without failing the job: Render deploys only when every check
+  # on the commit passes, and a job-level continue-on-error would still report this check
+  # as failed.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .node-version
+          # Nothing is installed here. The automatic npm cache (on because package.json
+          # has packageManager) would save a near-empty ~/.npm under the key web uses.
+          package-manager-cache: false
+
+      - name: npm audit
+        id: npm-audit
+        continue-on-error: true
+        run: npm audit --audit-level=high # reads package-lock.json, no install needed
+
+      # If this fails, cargo audit below fails too, and the warning reports it.
+      - uses: taiki-e/install-action@v2
+        continue-on-error: true
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        id: cargo-audit
+        continue-on-error: true
+        working-directory: wasm/market-gen
+        run: cargo audit
+
+      # A failed step under continue-on-error still leaves a green check, so say so on the
+      # run's summary page. A failure means findings, or the audit could not run at all.
+      - name: Report findings
+        if: steps.npm-audit.outcome == 'failure' || steps.cargo-audit.outcome == 'failure'
+        run: echo "::warning title=Dependency audit::npm audit ${{ steps.npm-audit.outcome }}, cargo audit ${{ steps.cargo-audit.outcome }}. See the job log."
