@@ -4,7 +4,7 @@
 
 A browser-only, real-time market data dashboard. A simulated market data producer, written in Rust and compiled to WebAssembly, runs in a Web Worker and generates up to 20,000 updates per second. The worker aggregates the stream into per-instrument metrics, and an Angular 22 UI shows them in a live table.
 
-- **Live demo:** <https://fintech-dashboard.onrender.com>. The footer shows the commit the page was built from.
+- **Live demo:** <https://fintech-dashboard-0c4b.onrender.com>. The footer shows the commit the page was built from.
 - **Specification:** [spec.md](spec.md) covers the requirements, architecture, decisions (ADRs), delivery plan and future work.
 
 ## Features
@@ -79,7 +79,7 @@ git push ──► GitHub Actions: wasm · web · audit ──► all checks pas
   - `audit`: `npm audit` and `cargo audit`. Findings show as a warning on the run and never block a deploy.
 - **Hosting** is a Render **Static Site**, defined as code in [`render.yaml`](render.yaml): the SPA rewrite for deep links, security headers (CSP, HSTS, `nosniff`, `Referrer-Policy`, `Permissions-Policy`) and caching rules. There is no server.
 - **Deploys are gated on CI.** `autoDeployTrigger: checksPass` makes Render build `main` only after every GitHub check on the commit passes, so a red pipeline never reaches production.
-- **The Render build** ([`scripts/render-build.sh`](scripts/render-build.sh)) installs a minimal Rust toolchain, because Render's image has none. It then runs `npm ci`, builds the Wasm and the app, and stamps the commit and build time into the footer.
+- **The Render build** ([`scripts/render-build.sh`](scripts/render-build.sh)) installs a minimal Rust toolchain into Render's build cache, because the Rust in Render's image is read-only and has no Wasm target. It then runs `npm ci`, builds the Wasm and the app, and stamps the commit and build time into the footer.
 
 To deploy your own copy: in Render, choose **New → Blueprint** and select the repository. Render reads `render.yaml`. Don't use "Web Service", because there is no server.
 
